@@ -15,6 +15,7 @@ import WhatsAppOrder from "./pages/WhatsAppOrder";
 import OnlineOrders from "./pages/OnlineOrders";
 import Shifts from "./pages/Shifts";
 import Promotions from "./pages/Promotions";
+import BarcodePrint from "./pages/BarcodePrint";
 import { Toaster } from "./components/ui/sonner";
 
 export default function App() {
@@ -31,6 +32,7 @@ export default function App() {
             <Route path="/online-orders" element={<ProtectedRoute><Layout><OnlineOrders /></Layout></ProtectedRoute>} />
             <Route path="/shifts" element={<ProtectedRoute><Layout><Shifts /></Layout></ProtectedRoute>} />
             <Route path="/promotions" element={<ProtectedRoute><Layout><Promotions /></Layout></ProtectedRoute>} />
+            <Route path="/barcodes" element={<ProtectedRoute><Layout><BarcodePrint /></Layout></ProtectedRoute>} />
             <Route path="/transactions" element={<ProtectedRoute><Layout><Transactions /></Layout></ProtectedRoute>} />
             <Route path="/analytics" element={<ProtectedRoute><Layout><Analytics /></Layout></ProtectedRoute>} />
             <Route path="/settings" element={<ProtectedRoute><Layout><Settings /></Layout></ProtectedRoute>} />

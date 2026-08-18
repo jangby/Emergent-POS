@@ -2,7 +2,7 @@ import { NavLink, useNavigate } from "react-router-dom";
 import { useState } from "react";
 import {
   ShoppingCart, Package, ScanLine, Receipt, BarChart3, Settings as Cog,
-  Sun, Moon, LogOut, Sparkles, MessageCircle, Truck, Clock, Tag, MoreHorizontal
+  Sun, Moon, LogOut, Sparkles, MessageCircle, Truck, Clock, Tag, MoreHorizontal, Barcode
 } from "lucide-react";
 import { useAuth } from "../context/AuthContext";
 import { useTheme } from "../context/ThemeContext";
@@ -17,6 +17,7 @@ const PRIMARY_NAV = [
 ];
 const SECONDARY_NAV = [
   { to: "/restock", label: "Scan Nota", icon: ScanLine, testid: "nav-restock" },
+  { to: "/barcodes", label: "Cetak Label", icon: Barcode, testid: "nav-barcodes" },
   { to: "/shifts", label: "Shift", icon: Clock, testid: "nav-shifts" },
   { to: "/promotions", label: "Promo", icon: Tag, testid: "nav-promo" },
   { to: "/transactions", label: "Riwayat", icon: Receipt, testid: "nav-transactions" },

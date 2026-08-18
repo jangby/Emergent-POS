@@ -407,6 +407,23 @@ async def confirm_restock(body: RestockIn, user: dict = Depends(get_current_user
             created += 1
     return {"updated": updated, "created": created}
 
+# --- Barcode label helpers ---
+@api.post("/products/generate-sku")
+async def generate_missing_sku(user: dict = Depends(get_current_user)):
+    """Assign KP-XXXXXXXX SKU to products missing it."""
+    prods = await db.products.find({"$or": [{"sku": {"$in": [None, ""]}}, {"sku": {"$exists": False}}]},
+                                   {"_id": 0}).to_list(2000)
+    updated = 0
+    for p in prods:
+        digits = "".join([c for c in p["id"] if c.isdigit()])[:8].ljust(8, "0")
+        sku = f"KP{digits}"
+        while await db.products.find_one({"sku": sku, "id": {"$ne": p["id"]}}):
+            digits = "".join([str((int(d) + 1) % 10) for d in digits])
+            sku = f"KP{digits}"
+        await db.products.update_one({"id": p["id"]}, {"$set": {"sku": sku}})
+        updated += 1
+    return {"updated": updated}
+
 # --- Barcode lookup ---
 @api.get("/products/by-sku/{sku}")
 async def product_by_sku(sku: str, user: dict = Depends(get_current_user)):
