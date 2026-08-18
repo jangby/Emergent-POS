@@ -1,0 +1,111 @@
+{
+  "project_name": "KasirPintar AI",
+  "theme_preference": "Both Light and Dark mode supported, utilizing an 'Organic & Earthy' approach tailored for Indonesian UMKM. High contrast, warm, and highly tactile.",
+  "typography": {
+    "headings_font": "Cabinet Grotesk",
+    "body_font": "Outfit",
+    "rules": [
+      "Use 'Cabinet Grotesk' (font-black or font-extrabold) for amounts, live totals, and top-level headings to give them a premium, authoritative look.",
+      "Use 'Outfit' for all product titles, table data, and UI elements for high legibility.",
+      "Strictly enforce tight letter spacing (tracking-tight) on large numbers (prices, totals).",
+      "No generic Inter or Roboto fonts."
+    ],
+    "scale": {
+      "H1": "text-4xl sm:text-5xl font-black tracking-tighter",
+      "H2": "text-2xl sm:text-3xl font-bold tracking-tight",
+      "H3": "text-xl font-bold",
+      "Body": "text-base leading-relaxed",
+      "Small": "text-sm uppercase tracking-widest font-medium text-muted-foreground"
+    }
+  },
+  "colors": {
+    "archetype": "Organic & Earthy with High-Energy Accent",
+    "palette": {
+      "primary": "#E85D04",
+      "primary_hover": "#DC2F02",
+      "background_light": "#F8F9FA",
+      "surface_light": "#FFFFFF",
+      "background_dark": "#0F172A",
+      "surface_dark": "#1E293B",
+      "text_dark": "#111827",
+      "text_light": "#F8FAFC",
+      "success": "#16A34A",
+      "warning": "#F59E0B",
+      "error": "#DC2626"
+    },
+    "rules": [
+      "The primary color (Terracotta/Orange) represents energy and commerce. Use it strictly for the primary CTAs (Pay/Bayar, Confirm Restock).",
+      "Use 'Tinted Grey' for borders and backgrounds. Never use pure #000000 or #FFFFFF without context.",
+      "Live IDR Totals should pop—use primary color or high-contrast text.",
+      "Ensure text over backgrounds meets a minimum 4.5:1 contrast ratio."
+    ]
+  },
+  "visual_enhancers": {
+    "pos_products": "Neumorphism (Tactile) - Use 1px subtle borders (border-border/40) with a slight top-left light/bottom-right dark shadow to make product cards feel incredibly clickable (like physical POS keys).",
+    "bottom_action_bar": "Glassmorphism - backdrop-blur-xl bg-white/80 (or bg-slate-900/80 in dark mode) with a delicate 1px top border. MUST sit fixed at bottom z-50.",
+    "modals": "Flat solid surfaces with max 8px border-radius. Do not use glass on OCR Review or QRIS modals to ensure absolute data legibility.",
+    "general": "Avoid default Shadcn card looks. Add 1px borders and slight shadow-sm. NEVER use fully transparent backgrounds where content scrolls underneath."
+  },
+  "layouts": {
+    "global": "Mobile-first. Hide desktop sidebar on mobile, show bottom navigation bar. On desktop, standard 250px left sidebar.",
+    "pos_screen": "On mobile: Product grid takes full height minus header and bottom bar. Cart is accessible via a floating FAB or bottom sheet. On desktop: 70% left for product grid, 30% right for sticky cart sidebar.",
+    "inventory_screen": "High-density data grid (grid-cols-1 md:grid-cols-4 gap-4). Use 'Bento' strategy for the Analytics dashboard on this screen.",
+    "spacing": "Use generous padding inside containers. Use p-4 for mobile cards, p-6 or p-8 for desktop panels."
+  },
+  "components": {
+    "pos_product_card": "Vertical stack: Image (h-24 object-cover), Title (truncate 2 lines), Price (Rp). Use absolute positioning for stock count badge.",
+    "cart_drawer": "Shadcn Sheet component for mobile, right-aligned. Contains list of items, quantity +/- buttons, discount input, tax info, and huge 'BAYAR' (Pay) button.",
+    "midtrans_qris_modal": "Shadcn Dialog. Clean, centered QR code image. Underneath: Animated polling status (Lucide Loader2 spinning) checking for payment. No glassmorphism.",
+    "ocr_review_drawer": "Bottom Sheet or Dialog showing extracted Receipt data (Name, Qty, Cost). Use Shadcn Table or dense input grid inside so merchant can edit before Confirming.",
+    "analytics_bento": "Mode B (High Density Grid). gap-4. Use Shadcn Charts (Recharts). AI Business Insights goes into a 'Tracing Beam' highlighted card.",
+    "printer_manager": "Settings form utilizing Shadcn Form, Input, and standard interactive buttons. List paired bluetooth devices."
+  },
+  "motion": {
+    "interactions": "All buttons MUST have hover:scale-[0.98] active:scale-95 transition-transform duration-200. Hover states must shift background color slightly.",
+    "lists": "Staggered fade-up for POS products.",
+    "polling": "Smooth pulse animation on the Midtrans waiting status text."
+  },
+  "responsive": {
+    "breakpoint": "Mobile-first design. Build for mobile screens first, enhance for desktop.",
+    "layout": "Use flex-col for mobile, switching to flex-row / grid-cols-2+ at md breakpoint.",
+    "typography": "Fluid typography or explicit step-downs (text-4xl md:text-5xl). Inputs must be min 16px font size on mobile to prevent iOS zoom.",
+    "overflow_guard": "Use overflow-x-hidden on the main container to prevent horizontal scrolling. Allow horizontal scroll specifically only inside data tables.",
+    "tap_targets": "All buttons, POS items, and list items MUST be min 44x44px for touch accuracy."
+  },
+  "accessibility": {
+    "contrast": "Ensure primary orange meets 3:1 on white/dark for buttons, 4.5:1 for text.",
+    "testing": "All interactive elements MUST have data-testid attributes (e.g., data-testid='pos-product-1', data-testid='cart-pay-button', data-testid='qris-modal-status')."
+  },
+  "media": {
+    "icons": "Use 'lucide-react' for all iconography (shopping-cart, printer, scan, qrcode, chart-bar). Use stroke-width 1.5 for elegance.",
+    "image_urls": {
+      "placeholder_coffee": "https://images.unsplash.com/photo-1511920170033-f8396924c348?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjAzMjV8MHwxfHNlYXJjaHwyfHxjb2ZmZWUlMjBjdXB8ZW58MHx8fHwxNzg3MDkxMDM3fDA&ixlib=rb-4.1.0&q=85",
+      "placeholder_noodles": "https://images.unsplash.com/photo-1612927601601-6638404737ce?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjA1NzV8MHwxfHNlYXJjaHwyfHxpbnN0YW50JTIwbm9vZGxlc3xlbnwwfHx8fDE3ODcwOTEwMzh8MA&ixlib=rb-4.1.0&q=85",
+      "placeholder_oil": "https://images.unsplash.com/photo-1666694890460-37ec16b0df47?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NTYxODF8MHwxfHNlYXJjaHw0fHxjb29raW5nJTIwb2lsJTIwYm90dGxlfGVufDB8fHx8MTc4NzA5MTAzOHww&ixlib=rb-4.1.0&q=85"
+    }
+  },
+  "instructions_to_main_agent": [
+    "CREATE FILES USING .js AND .jsx EXTENSIONS. DO NOT USE .tsx",
+    "DO NOT use generic centered layouts or plain Bootstrap-style cards. Elevate the design with 1px borders, careful shadow layering, and high-contrast typography.",
+    "FORMAT CURRENCY PROPERLY: Use Intl.NumberFormat for IDR (Rp). Do not use decimals for IDR unless absolutely necessary.",
+    "Create a mobile-first sticky bottom navigation for mobile, and a left sidebar for desktop views.",
+    "For the POS grid, prioritize huge tap targets and fast scanning. Images should be crisp, text highly readable.",
+    "Use 'lucide-react' for icons. Do NOT use AI emojis (e.g., 🤖, 💡) as icons.",
+    "Integrate Shadcn UI but heavily customize the rounded corners (max 8px) and border colors to match the earthy/warm Indonesian vibe.",
+    "Ensure 'Stok Menipis' (low stock alerts) use the Warning (#F59E0B) or Error (#DC2626) colors boldly.",
+    "The Midtrans QRIS modal must include a realistic polling state (spinner + 'Menunggu Pembayaran...').",
+    "Use 'sonner' for toast notifications, configured at /app/src/components/ui/sonner.js",
+    "Provide clear data-testid attributes for everything (buttons, inputs, totals) to ensure automated tests pass."
+  ],
+  "UNIVERSAL GUIDELINES FOR MAIN AGENT": [
+    "You tend to converge toward generic outputs. Avoid this: make creative, distinctive frontends that surprise and delight.",
+    "Create depth through layered design elements with z-index hierarchy.",
+    "Use glass-morphism effects with backdrop filters (12-24px blur) for sticky navs.",
+    "You MUST NOT apply universal transition. Eg: transition: all. Always add transitions for specific interactive elements like button, input excluding transforms.",
+    "You MUST NOT center align the app container, ie do not add .App { text-align: center; } in the css file.",
+    "Always use modern button styles with interaction animations & color relevant to the app style.",
+    "Every interaction needs micro-animations - hover states, transitions, and entrance animations.",
+    "Use generous spacing. Cramped designs look cheap.",
+    "Main agent MUST USE the provided image URLs. Missing categories = main agent will use placeholder text which is FORBIDDEN."
+  ]
+}
