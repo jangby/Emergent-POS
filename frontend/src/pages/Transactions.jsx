@@ -6,9 +6,10 @@ import { Input } from "../components/ui/input";
 import { Button } from "../components/ui/button";
 import { Badge } from "../components/ui/badge";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "../components/ui/dialog";
-import { Search, Printer, Receipt, MessageCircle, Send } from "lucide-react";
+import { Search, Printer, Receipt, MessageCircle, Send, Download } from "lucide-react";
 import { printReceipt, printReceiptWeb, isBluetoothSupported } from "../lib/bluetooth";
 import { toast } from "sonner";
+import { API_BASE } from "../lib/api";
 
 export default function Transactions() {
   const [items, setItems] = useState([]);
@@ -49,9 +50,16 @@ export default function Transactions() {
 
   return (
     <div className="max-w-6xl mx-auto space-y-5">
-      <div>
-        <h1 className="font-display text-3xl md:text-4xl font-black tracking-tighter">Riwayat Transaksi</h1>
-        <p className="text-sm text-muted-foreground">30 hari terakhir.</p>
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <h1 className="font-display text-3xl md:text-4xl font-black tracking-tighter">Riwayat Transaksi</h1>
+          <p className="text-sm text-muted-foreground">30 hari terakhir.</p>
+        </div>
+        <a href={`${API_BASE}/exports/transactions.xlsx?days=30`} target="_blank" rel="noopener noreferrer">
+          <Button variant="outline" className="tap" data-testid="export-tx-btn">
+            <Download className="h-4 w-4 mr-1" /> Export Excel
+          </Button>
+        </a>
       </div>
       <div className="relative max-w-md">
         <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />

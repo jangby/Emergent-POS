@@ -12,6 +12,9 @@ import Analytics from "./pages/Analytics";
 import Settings from "./pages/Settings";
 import RestockAI from "./pages/RestockAI";
 import WhatsAppOrder from "./pages/WhatsAppOrder";
+import OnlineOrders from "./pages/OnlineOrders";
+import Shifts from "./pages/Shifts";
+import Promotions from "./pages/Promotions";
 import { Toaster } from "./components/ui/sonner";
 
 export default function App() {
@@ -25,6 +28,9 @@ export default function App() {
             <Route path="/inventory" element={<ProtectedRoute><Layout><Inventory /></Layout></ProtectedRoute>} />
             <Route path="/restock" element={<ProtectedRoute><Layout><RestockAI /></Layout></ProtectedRoute>} />
             <Route path="/wa-orders" element={<ProtectedRoute><Layout><WhatsAppOrder /></Layout></ProtectedRoute>} />
+            <Route path="/online-orders" element={<ProtectedRoute><Layout><OnlineOrders /></Layout></ProtectedRoute>} />
+            <Route path="/shifts" element={<ProtectedRoute><Layout><Shifts /></Layout></ProtectedRoute>} />
+            <Route path="/promotions" element={<ProtectedRoute><Layout><Promotions /></Layout></ProtectedRoute>} />
             <Route path="/transactions" element={<ProtectedRoute><Layout><Transactions /></Layout></ProtectedRoute>} />
             <Route path="/analytics" element={<ProtectedRoute><Layout><Analytics /></Layout></ProtectedRoute>} />
             <Route path="/settings" element={<ProtectedRoute><Layout><Settings /></Layout></ProtectedRoute>} />

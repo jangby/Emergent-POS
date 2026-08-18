@@ -234,6 +234,7 @@ class TransactionIn(BaseModel):
     change: int = 0
     qris_order_id: Optional[str] = None
     qris_status: Optional[str] = None
+    applied_promos: List[dict] = []
 
 @api.post("/transactions")
 async def create_transaction(body: TransactionIn, user: dict = Depends(get_current_user)):
@@ -242,6 +243,8 @@ async def create_transaction(body: TransactionIn, user: dict = Depends(get_curre
     net_profit = 0
     for it in body.items:
         net_profit += (it.price - it.buy_price) * it.qty - it.discount
+    # Link to open shift, if any
+    open_shift = await db.shifts.find_one({"user_id": user["id"], "status": "open"})
     doc = {"id": tid, "order_id": order_id,
            "items": [i.model_dump() for i in body.items],
            "subtotal": body.subtotal, "discount": body.discount,
@@ -249,15 +252,25 @@ async def create_transaction(body: TransactionIn, user: dict = Depends(get_curre
            "payment_method": body.payment_method,
            "cash_tendered": body.cash_tendered, "change": body.change,
            "qris_order_id": body.qris_order_id, "qris_status": body.qris_status,
+           "applied_promos": body.applied_promos,
            "status": "completed" if body.payment_method == "cash" or body.qris_status in ("settlement", "capture") else "pending",
            "net_profit": net_profit,
            "cashier": user["email"],
+           "cashier_id": user["id"],
+           "shift_id": open_shift["id"] if open_shift else None,
            "created_at": now_utc().isoformat()}
     await db.transactions.insert_one(doc)
 
     # Deduct stock
+    pids = []
     for it in body.items:
         await db.products.update_one({"id": it.product_id}, {"$inc": {"stock": -it.qty}})
+        pids.append(it.product_id)
+    # Low-stock WA alert (fire and forget)
+    try:
+        asyncio.create_task(check_low_stock_and_alert(pids))
+    except Exception:
+        pass
 
     return strip_id(doc)
 
@@ -710,12 +723,568 @@ async def midtrans_webhook(request: Request):
     expected = hashlib.sha512(f"{order_id}{status_code}{gross_amount}{creds['server_key']}".encode()).hexdigest()
     if not hmac.compare_digest(expected, supplied):
         raise HTTPException(403, "invalid signature")
+    tx_status = payload.get("transaction_status")
     await db.qris_payments.update_one({"order_id": order_id},
-                                      {"$set": {"status": payload.get("transaction_status"),
+                                      {"$set": {"status": tx_status,
                                                 "last_webhook": payload,
                                                 "updated_at": now_utc().isoformat()}},
                                       upsert=True)
+    # If it's a WA-initiated order, notify customer & advance state
+    if tx_status in ("settlement", "capture"):
+        wa_order = await db.online_orders.find_one({"midtrans_order_id": order_id})
+        if wa_order and wa_order.get("status") != "paid":
+            await db.online_orders.update_one({"id": wa_order["id"]},
+                {"$set": {"status": "paid", "paid_at": now_utc().isoformat()}})
+            await db.wa_sessions.update_one({"phone": wa_order["customer_phone"]},
+                {"$set": {"state": "done"}})
+            try:
+                await wa_send_raw(wa_order["customer_phone"],
+                    f"✅ *Pembayaran Berhasil!* Pesanan #{wa_order['id'][:6].upper()} sedang diproses. Terima kasih 🙏")
+            except Exception:
+                pass
     return {"ok": True}
+
+
+# ============================================================
+# Multi-Cashier & Shifts, Promotions, Online Orders,
+# Automated WhatsApp Bot, Low-Stock Alerts, Excel Exports
+# ============================================================
+
+# --- Users (cashier management) ---
+class CashierIn(BaseModel):
+    email: EmailStr
+    password: str = Field(min_length=6)
+    name: str = "Kasir"
+
+@api.get("/users")
+async def list_users(user: dict = Depends(get_current_user)):
+    users = await db.users.find({}, {"_id": 0, "password_hash": 0}).to_list(200)
+    return users
+
+@api.post("/users/cashier")
+async def create_cashier(body: CashierIn, user: dict = Depends(get_current_user)):
+    email = body.email.lower()
+    if await db.users.find_one({"email": email}):
+        raise HTTPException(400, "Email sudah terdaftar")
+    uid = str(uuid.uuid4())
+    await db.users.insert_one({
+        "id": uid, "email": email, "name": body.name, "role": "cashier",
+        "password_hash": hash_password(body.password),
+        "created_at": now_utc().isoformat(),
+    })
+    return {"id": uid, "email": email, "name": body.name, "role": "cashier"}
+
+@api.delete("/users/{uid}")
+async def delete_cashier(uid: str, user: dict = Depends(get_current_user)):
+    doc = await db.users.find_one({"id": uid})
+    if doc and doc.get("role") == "owner":
+        raise HTTPException(400, "Tidak bisa menghapus owner")
+    await db.users.delete_one({"id": uid})
+    return {"ok": True}
+
+# --- Shifts ---
+class ShiftOpenIn(BaseModel):
+    opening_cash: int = Field(ge=0)
+
+class ShiftCloseIn(BaseModel):
+    closing_cash_actual: int = Field(ge=0)
+    notes: str = ""
+
+async def get_open_shift(user_id: str) -> Optional[dict]:
+    return await db.shifts.find_one({"user_id": user_id, "status": "open"}, {"_id": 0})
+
+async def compute_shift_totals(shift_id: str) -> dict:
+    txs = await db.transactions.find({"shift_id": shift_id, "status": "completed"},
+                                     {"_id": 0}).to_list(2000)
+    cash_total = sum(t["total"] for t in txs if t["payment_method"] == "cash")
+    qris_total = sum(t["total"] for t in txs if t["payment_method"] == "qris")
+    return {"tx_count": len(txs), "cash_total": cash_total, "qris_total": qris_total,
+            "grand_total": cash_total + qris_total,
+            "profit": sum(t.get("net_profit", 0) for t in txs)}
+
+@api.get("/shifts/current")
+async def shift_current(user: dict = Depends(get_current_user)):
+    s = await get_open_shift(user["id"])
+    if not s:
+        return {"open": False}
+    totals = await compute_shift_totals(s["id"])
+    return {"open": True, "shift": s, "totals": totals}
+
+@api.post("/shifts/open")
+async def shift_open(body: ShiftOpenIn, user: dict = Depends(get_current_user)):
+    existing = await get_open_shift(user["id"])
+    if existing:
+        raise HTTPException(400, "Shift sudah dibuka. Tutup dulu.")
+    sid = str(uuid.uuid4())
+    doc = {"id": sid, "user_id": user["id"], "user_email": user["email"],
+           "user_name": user.get("name", ""),
+           "opening_cash": body.opening_cash, "status": "open",
+           "opened_at": now_utc().isoformat()}
+    await db.shifts.insert_one(doc)
+    return strip_id(doc)
+
+@api.post("/shifts/close")
+async def shift_close(body: ShiftCloseIn, user: dict = Depends(get_current_user)):
+    s = await get_open_shift(user["id"])
+    if not s:
+        raise HTTPException(400, "Tidak ada shift aktif")
+    totals = await compute_shift_totals(s["id"])
+    expected_cash = s["opening_cash"] + totals["cash_total"]
+    discrepancy = body.closing_cash_actual - expected_cash
+    await db.shifts.update_one({"id": s["id"]}, {"$set": {
+        "status": "closed", "closed_at": now_utc().isoformat(),
+        "closing_cash_expected": expected_cash,
+        "closing_cash_actual": body.closing_cash_actual,
+        "discrepancy": discrepancy, "notes": body.notes,
+        "totals": totals,
+    }})
+    doc = await db.shifts.find_one({"id": s["id"]}, {"_id": 0})
+    return doc
+
+@api.get("/shifts")
+async def list_shifts(user: dict = Depends(get_current_user)):
+    items = await db.shifts.find({}, {"_id": 0}).sort("opened_at", -1).to_list(100)
+    return items
+
+# --- Promotions ---
+class PromotionIn(BaseModel):
+    name: str
+    type: Literal["percentage", "fixed", "bxgy", "min_purchase"]
+    value: int = 0          # percentage or fixed rp
+    product_id: Optional[str] = None   # for pct/fixed on specific product
+    buy_qty: int = 0        # for bxgy
+    get_product_id: Optional[str] = None
+    get_qty: int = 0
+    min_purchase: int = 0   # for min_purchase / free-delivery
+    active: bool = True
+
+@api.get("/promotions")
+async def list_promos(user: dict = Depends(get_current_user)):
+    return await db.promotions.find({}, {"_id": 0}).sort("name", 1).to_list(200)
+
+@api.post("/promotions")
+async def create_promo(body: PromotionIn, user: dict = Depends(get_current_user)):
+    pid = str(uuid.uuid4())
+    doc = {"id": pid, **body.model_dump(), "created_at": now_utc().isoformat()}
+    await db.promotions.insert_one(doc)
+    return strip_id(doc)
+
+@api.put("/promotions/{pid}")
+async def update_promo(pid: str, body: PromotionIn, user: dict = Depends(get_current_user)):
+    await db.promotions.update_one({"id": pid}, {"$set": body.model_dump()})
+    return await db.promotions.find_one({"id": pid}, {"_id": 0})
+
+@api.delete("/promotions/{pid}")
+async def delete_promo(pid: str, user: dict = Depends(get_current_user)):
+    await db.promotions.delete_one({"id": pid})
+    return {"ok": True}
+
+@api.post("/promotions/preview")
+async def promo_preview(payload: dict, user: dict = Depends(get_current_user)):
+    """Given cart items [{product_id, name, qty, price}], return applied promos + total discount."""
+    items = payload.get("items", [])
+    subtotal = sum(i["price"] * i["qty"] for i in items)
+    result = await apply_promotions(items, subtotal)
+    return result
+
+async def apply_promotions(items: List[dict], subtotal: int) -> dict:
+    promos = await db.promotions.find({"active": True}, {"_id": 0}).to_list(200)
+    applied = []
+    total_discount = 0
+    free_items = []
+    free_delivery = False
+    for p in promos:
+        if p["type"] == "percentage":
+            if p.get("product_id"):
+                for it in items:
+                    if it["product_id"] == p["product_id"]:
+                        d = int(it["price"] * it["qty"] * (p["value"] / 100))
+                        total_discount += d
+                        applied.append({"name": p["name"], "discount": d})
+            else:
+                d = int(subtotal * (p["value"] / 100))
+                total_discount += d
+                applied.append({"name": p["name"], "discount": d})
+        elif p["type"] == "fixed":
+            if p.get("product_id"):
+                for it in items:
+                    if it["product_id"] == p["product_id"]:
+                        d = min(it["price"] * it["qty"], p["value"])
+                        total_discount += d
+                        applied.append({"name": p["name"], "discount": d})
+            else:
+                d = min(subtotal, p["value"])
+                total_discount += d
+                applied.append({"name": p["name"], "discount": d})
+        elif p["type"] == "bxgy":
+            for it in items:
+                if it["product_id"] == p.get("product_id") and it["qty"] >= p["buy_qty"] > 0:
+                    times = it["qty"] // p["buy_qty"]
+                    free_items.append({"product_id": p.get("get_product_id"),
+                                       "qty": p["get_qty"] * times,
+                                       "promo": p["name"]})
+                    applied.append({"name": p["name"], "discount": 0, "free": p["get_qty"] * times})
+        elif p["type"] == "min_purchase":
+            if subtotal >= p["min_purchase"] and p["min_purchase"] > 0:
+                if p["value"] > 0:
+                    total_discount += p["value"]
+                    applied.append({"name": p["name"], "discount": p["value"]})
+                else:
+                    free_delivery = True
+                    applied.append({"name": p["name"], "free_delivery": True})
+    return {"applied": applied, "total_discount": total_discount,
+            "free_items": free_items, "free_delivery": free_delivery,
+            "final_total": max(0, subtotal - total_discount)}
+
+# --- Low-stock alert helper ---
+async def check_low_stock_and_alert(product_ids: List[str]):
+    """After stock decrement, notify owner via WA if any product is at/under threshold (<=5)."""
+    st = await db.settings.find_one({"id": "default"}) or {}
+    fn = st.get("fonnte", {})
+    store = st.get("store", {})
+    if not fn.get("token_enc") or not store.get("phone"):
+        return
+    triggered = []
+    for pid in set(product_ids):
+        p = await db.products.find_one({"id": pid}, {"_id": 0})
+        if not p:
+            continue
+        threshold = p.get("min_stock", 5) or 5
+        # only alert on transition into low (avoid spam) — use last_alert timestamp check
+        if p["stock"] <= threshold:
+            last = p.get("last_low_alert_at")
+            recent = last and (datetime.fromisoformat(last) > now_utc() - timedelta(hours=6))
+            if not recent:
+                triggered.append(p)
+                await db.products.update_one({"id": pid},
+                                             {"$set": {"last_low_alert_at": now_utc().isoformat()}})
+    if not triggered:
+        return
+    try:
+        token = dec(fn["token_enc"])
+        msg = "⚠️ *PERINGATAN STOK*\n\n"
+        for p in triggered:
+            msg += f"• {p['name']} sisa *{p['stock']}* pcs\n"
+        msg += "\nSegera lakukan restok!"
+        target = normalize_wa_target(store["phone"])
+        async with httpx.AsyncClient(timeout=15) as hc:
+            await hc.post("https://api.fonnte.com/send",
+                          headers={"Authorization": token},
+                          data={"target": target, "message": msg, "countryCode": "62"})
+    except Exception:
+        logging.exception("Low-stock alert failed")
+
+# --- WA send helpers (no auth, for bot) ---
+async def wa_send_raw(target: str, message: str, image_url: Optional[str] = None) -> dict:
+    st = await db.settings.find_one({"id": "default"}) or {}
+    tk_enc = st.get("fonnte", {}).get("token_enc")
+    if not tk_enc:
+        raise RuntimeError("Fonnte not configured")
+    token = dec(tk_enc)
+    data = {"target": normalize_wa_target(target), "message": message, "countryCode": "62"}
+    if image_url:
+        data["url"] = image_url
+    async with httpx.AsyncClient(timeout=25) as hc:
+        r = await hc.post("https://api.fonnte.com/send",
+                          headers={"Authorization": token}, data=data)
+    try:
+        return r.json()
+    except Exception:
+        return {"raw": r.text}
+
+# --- Online Orders ---
+@api.get("/online-orders")
+async def list_online_orders(user: dict = Depends(get_current_user)):
+    return await db.online_orders.find({}, {"_id": 0}).sort("created_at", -1).to_list(200)
+
+@api.post("/online-orders/{oid}/mark-shipped")
+async def mark_shipped(oid: str, user: dict = Depends(get_current_user)):
+    doc = await db.online_orders.find_one({"id": oid})
+    if not doc:
+        raise HTTPException(404, "Order tidak ditemukan")
+    if doc.get("status") == "shipped":
+        return {"ok": True, "note": "sudah dikirim"}
+    # Decrement stock only when shipped (was reserved on payment)
+    for it in doc.get("items", []):
+        await db.products.update_one({"id": it["product_id"]},
+                                     {"$inc": {"stock": -it["qty"]}})
+    await db.online_orders.update_one({"id": oid},
+                                      {"$set": {"status": "shipped",
+                                                "shipped_at": now_utc().isoformat(),
+                                                "shipped_by": user["email"]}})
+    # Notify customer
+    try:
+        await wa_send_raw(doc["customer_phone"],
+                          f"📦 Pesanan #{doc['id'][:6].upper()} telah dikirim ke {doc.get('address', 'alamat Anda')}. Terima kasih!")
+    except Exception:
+        pass
+    await check_low_stock_and_alert([it["product_id"] for it in doc.get("items", [])])
+    return await db.online_orders.find_one({"id": oid}, {"_id": 0})
+
+# --- WhatsApp bot state machine ---
+# States: idle -> awaiting_confirm -> awaiting_address -> awaiting_payment -> done
+async def bot_reply(phone: str, incoming: str):
+    """Process incoming WA message and reply. All persistence via db.wa_sessions."""
+    sess = await db.wa_sessions.find_one({"phone": phone})
+    if not sess:
+        sess = {"phone": phone, "state": "idle", "cart": [], "created_at": now_utc().isoformat()}
+        await db.wa_sessions.insert_one(sess)
+
+    txt = (incoming or "").strip()
+    lower = txt.lower()
+
+    # Global commands
+    if lower in ("batal", "cancel", "reset"):
+        await db.wa_sessions.update_one({"phone": phone},
+                                        {"$set": {"state": "idle", "cart": []}})
+        await wa_send_raw(phone, "Pesanan dibatalkan. Ketik menu produk yang ingin dipesan untuk mulai lagi.")
+        return
+
+    state = sess.get("state", "idle")
+
+    if state in ("idle", "done"):
+        # Parse order via AI
+        try:
+            from emergentintegrations.llm.chat import LlmChat, UserMessage
+            products = await db.products.find({}, {"_id": 0}).to_list(500)
+            catalog = "\n".join([f"- {p['name']} (id={p['id']}, harga={p['sell_price']}, stok={p['stock']})" for p in products])
+            chat = LlmChat(api_key=EMERGENT_LLM_KEY, session_id=f"wa-{uuid.uuid4()}",
+                system_message=("Cocokkan item pesanan pelanggan dengan katalog. Balas ONLY JSON: "
+                                '{"items":[{"product_id":"...","name":"...","qty":<int>}],"unmatched":["..."]}.'
+                                "Jangan pakai markdown.")
+            ).with_model("gemini", "gemini-3-flash-preview")
+            r = await chat.send_message(UserMessage(text=f"KATALOG:\n{catalog}\n\nPESAN:\n{txt}"))
+            import re, json
+            t = re.sub(r"^```(json)?", "", str(r).strip()).rstrip("`").strip()
+            m = re.search(r"\{.*\}", t, re.DOTALL)
+            parsed = json.loads(m.group(0)) if m else {"items": [], "unmatched": []}
+        except Exception:
+            parsed = {"items": [], "unmatched": []}
+
+        by_id = {p["id"]: p for p in products}
+        cart = []
+        for it in parsed.get("items", []):
+            pr = by_id.get(it.get("product_id"))
+            if pr and pr["stock"] >= int(it.get("qty", 1)):
+                cart.append({"product_id": pr["id"], "name": pr["name"],
+                             "qty": int(it["qty"]), "price": pr["sell_price"],
+                             "buy_price": pr["buy_price"]})
+        if not cart:
+            await wa_send_raw(phone,
+                "Halo! 👋 Sepertinya saya belum menemukan produk yang cocok. "
+                "Coba sebutkan nama produk lebih spesifik, contoh:\n"
+                "- Indomie Goreng 2\n- Kopi Kapal Api 3")
+            return
+
+        subtotal = sum(c["price"] * c["qty"] for c in cart)
+        promo = await apply_promotions(cart, subtotal)
+        total = promo["final_total"]
+
+        summary = "\n".join([f"- {c['qty']}× {c['name']} = Rp{c['price']*c['qty']:,}".replace(",", ".") for c in cart])
+        promo_lines = "\n".join([f"🎁 {a['name']}: -Rp{a.get('discount',0):,}".replace(",", ".") for a in promo["applied"]])
+        msg = (f"Pesanan Anda:\n{summary}\n"
+               f"{promo_lines + chr(10) if promo_lines else ''}"
+               f"*Total: Rp{total:,}*\n\n"
+               "Ketik *YA* untuk lanjut, atau kirim ulang pesanan.").replace(",", ".")
+        await db.wa_sessions.update_one({"phone": phone},
+            {"$set": {"state": "awaiting_confirm", "cart": cart, "total": total,
+                      "subtotal": subtotal, "promo": promo,
+                      "updated_at": now_utc().isoformat()}})
+        await wa_send_raw(phone, msg)
+        return
+
+    if state == "awaiting_confirm":
+        if lower in ("ya", "yes", "y", "ok", "oke"):
+            await db.wa_sessions.update_one({"phone": phone},
+                {"$set": {"state": "awaiting_name"}})
+            await wa_send_raw(phone, "Baik! Boleh saya minta *nama penerima*?")
+            return
+        # else re-parse
+        await db.wa_sessions.update_one({"phone": phone}, {"$set": {"state": "idle"}})
+        return await bot_reply(phone, txt)
+
+    if state == "awaiting_name":
+        await db.wa_sessions.update_one({"phone": phone},
+            {"$set": {"state": "awaiting_address", "customer_name": txt}})
+        await wa_send_raw(phone, "Terima kasih 🙏 Mohon kirim *alamat lengkap pengiriman* Anda.")
+        return
+
+    if state == "awaiting_address":
+        # Create online order and QRIS
+        cart = sess.get("cart", [])
+        total = sess.get("total", 0)
+        oid = str(uuid.uuid4())
+        order_id_mt = f"WA{oid[:10].upper()}"
+        order_doc = {
+            "id": oid, "midtrans_order_id": order_id_mt,
+            "customer_phone": phone, "customer_name": sess.get("customer_name", ""),
+            "address": txt, "items": cart,
+            "subtotal": sess.get("subtotal", total),
+            "discount": sess.get("subtotal", total) - total,
+            "total": total, "status": "awaiting_payment",
+            "created_at": now_utc().isoformat(),
+        }
+        await db.online_orders.insert_one(order_doc)
+        # Create QRIS via Midtrans
+        try:
+            creds = await get_midtrans_creds()
+            payload = {"payment_type": "qris",
+                       "transaction_details": {"order_id": order_id_mt, "gross_amount": total},
+                       "qris": {"acquirer": "gopay"}}
+            async with httpx.AsyncClient(timeout=20) as hc:
+                r = await hc.post(f"{midtrans_base(creds['mode'])}/v2/charge",
+                                  json=payload, auth=(creds['server_key'], ""),
+                                  headers={"Accept": "application/json"})
+            data = r.json()
+            qr_url = None
+            for a in data.get("actions", []):
+                if a.get("name") in ("generate-qr-code-v2", "generate-qr-code"):
+                    qr_url = a["url"]; break
+            await db.online_orders.update_one({"id": oid},
+                {"$set": {"qr_url": qr_url, "midtrans_data": data}})
+            await db.wa_sessions.update_one({"phone": phone},
+                {"$set": {"state": "awaiting_payment", "order_id": oid,
+                          "midtrans_order_id": order_id_mt}})
+            await wa_send_raw(phone,
+                f"📱 Silakan bayar via QRIS berikut sebesar *Rp{total:,}*.\n"
+                f"Setelah bayar, kami otomatis proses pesanan Anda. Terima kasih!".replace(",", "."),
+                image_url=qr_url)
+        except Exception as e:
+            logging.exception("QRIS create in WA failed")
+            await wa_send_raw(phone,
+                f"Mohon maaf, pembayaran QRIS belum bisa dibuat: {str(e)}. Silakan coba lagi nanti.")
+        return
+
+    if state == "awaiting_payment":
+        # Customer says something while waiting
+        await wa_send_raw(phone, "Kami masih menunggu pembayaran QRIS Anda. Ketik *BATAL* untuk membatalkan.")
+        return
+
+class WAWebhookIn(BaseModel):
+    device: Optional[str] = None
+    sender: Optional[str] = None
+    message: Optional[str] = None
+
+@api.post("/whatsapp/webhook")
+async def whatsapp_webhook(request: Request):
+    # Fonnte posts form-encoded typically. Support both.
+    try:
+        form = await request.form()
+        data = dict(form)
+    except Exception:
+        data = await request.json()
+    sender = str(data.get("sender") or data.get("from") or "").strip()
+    message = str(data.get("message") or data.get("text") or "").strip()
+    if not sender or not message:
+        return {"ok": True, "note": "empty"}
+    try:
+        asyncio.create_task(bot_reply(sender, message))
+    except Exception:
+        logging.exception("bot_reply schedule failed")
+    return {"ok": True}
+
+# Enhance Midtrans webhook to also handle WA-initiated online orders
+@api.post("/whatsapp/simulate-payment/{oid}")
+async def wa_simulate_payment(oid: str, user: dict = Depends(get_current_user)):
+    """Owner-triggered simulation for demo: mark WA order paid & notify customer."""
+    o = await db.online_orders.find_one({"id": oid})
+    if not o:
+        raise HTTPException(404, "Order tidak ditemukan")
+    await db.online_orders.update_one({"id": oid},
+        {"$set": {"status": "paid", "paid_at": now_utc().isoformat()}})
+    await db.wa_sessions.update_one({"phone": o["customer_phone"]},
+        {"$set": {"state": "done"}})
+    try:
+        await wa_send_raw(o["customer_phone"],
+            f"✅ *Pembayaran Berhasil!* Pesanan #{oid[:6].upper()} sedang kami proses. Kami akan info saat dikirim. Terima kasih 🙏")
+    except Exception:
+        pass
+    return {"ok": True}
+
+# --- Excel Exports ---
+def _xlsx_response(rows: List[dict], sheet_name: str, filename: str, headers: List[str]):
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill
+    from io import BytesIO
+    wb = Workbook()
+    ws = wb.active
+    ws.title = sheet_name[:31]
+    header_fill = PatternFill("solid", fgColor="E85D04")
+    header_font = Font(bold=True, color="FFFFFF")
+    for col, h in enumerate(headers, 1):
+        c = ws.cell(row=1, column=col, value=h)
+        c.fill = header_fill; c.font = header_font
+    for r_idx, row in enumerate(rows, 2):
+        for c_idx, h in enumerate(headers, 1):
+            ws.cell(row=r_idx, column=c_idx, value=row.get(h, ""))
+    for col in range(1, len(headers) + 1):
+        ws.column_dimensions[chr(64 + col) if col <= 26 else 'AA'].width = 20
+    buf = BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    from fastapi.responses import StreamingResponse
+    return StreamingResponse(buf,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+
+@api.get("/exports/transactions.xlsx")
+async def export_transactions(days: int = 30, user: dict = Depends(get_current_user)):
+    cutoff = (now_utc() - timedelta(days=days)).isoformat()
+    txs = await db.transactions.find({"created_at": {"$gte": cutoff}},
+                                     {"_id": 0}).sort("created_at", -1).to_list(5000)
+    rows = []
+    for t in txs:
+        items_str = "; ".join([f"{i['qty']}x {i['name']}" for i in t.get("items", [])])
+        rows.append({
+            "Order ID": t.get("order_id", ""),
+            "Tanggal": t.get("created_at", "")[:19].replace("T", " "),
+            "Kasir": t.get("cashier", ""),
+            "Metode": t.get("payment_method", "").upper(),
+            "Status": t.get("status", ""),
+            "Subtotal": t.get("subtotal", 0),
+            "Diskon": t.get("discount", 0),
+            "Total": t.get("total", 0),
+            "Laba": t.get("net_profit", 0),
+            "Items": items_str,
+        })
+    return _xlsx_response(rows, "Transaksi", f"transaksi_{days}h.xlsx",
+                          ["Order ID", "Tanggal", "Kasir", "Metode", "Status",
+                           "Subtotal", "Diskon", "Total", "Laba", "Items"])
+
+@api.get("/exports/inventory.xlsx")
+async def export_inventory(user: dict = Depends(get_current_user)):
+    prods = await db.products.find({}, {"_id": 0}).sort("name", 1).to_list(2000)
+    rows = [{
+        "Nama": p["name"], "Kategori": p["category"], "SKU": p.get("sku", ""),
+        "Stok": p.get("stock", 0), "Harga Modal": p.get("buy_price", 0),
+        "Harga Jual": p.get("sell_price", 0),
+        "Nilai Stok (Modal)": p.get("stock", 0) * p.get("buy_price", 0),
+    } for p in prods]
+    return _xlsx_response(rows, "Inventaris", "inventaris.xlsx",
+                          ["Nama", "Kategori", "SKU", "Stok",
+                           "Harga Modal", "Harga Jual", "Nilai Stok (Modal)"])
+
+@api.get("/exports/shifts.xlsx")
+async def export_shifts(user: dict = Depends(get_current_user)):
+    shifts = await db.shifts.find({"status": "closed"}, {"_id": 0}).sort("closed_at", -1).to_list(500)
+    rows = []
+    for s in shifts:
+        t = s.get("totals", {})
+        rows.append({
+            "Kasir": s.get("user_email", ""),
+            "Buka": (s.get("opened_at") or "")[:19].replace("T", " "),
+            "Tutup": (s.get("closed_at") or "")[:19].replace("T", " "),
+            "Modal Awal": s.get("opening_cash", 0),
+            "Kas Tunai": t.get("cash_total", 0),
+            "QRIS": t.get("qris_total", 0),
+            "Total": t.get("grand_total", 0),
+            "Kas Aktual": s.get("closing_cash_actual", 0),
+            "Selisih": s.get("discrepancy", 0),
+        })
+    return _xlsx_response(rows, "Shift", "shift_report.xlsx",
+                          ["Kasir", "Buka", "Tutup", "Modal Awal", "Kas Tunai",
+                           "QRIS", "Total", "Kas Aktual", "Selisih"])
+
 
 # --- Seed ---
 SEED_PRODUCTS = [
@@ -749,7 +1318,13 @@ async def seed_data():
     # indexes
     await db.users.create_index("email", unique=True)
     await db.products.create_index("name")
+    await db.products.create_index("sku")
     await db.transactions.create_index("created_at")
+    await db.transactions.create_index("shift_id")
+    await db.shifts.create_index("user_id")
+    await db.online_orders.create_index("created_at")
+    await db.online_orders.create_index("midtrans_order_id")
+    await db.wa_sessions.create_index("phone", unique=True)
 
     # admin
     existing = await db.users.find_one({"email": ADMIN_EMAIL.lower()})

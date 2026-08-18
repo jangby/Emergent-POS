@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import api from "../lib/api";
 import { formatIDR } from "../lib/format";
 import { Input } from "../components/ui/input";
@@ -25,13 +25,50 @@ export default function POS() {
   const [store, setStore] = useState({});
   const [completedTx, setCompletedTx] = useState(null);
   const [scannerOpen, setScannerOpen] = useState(false);
+  const [shiftStatus, setShiftStatus] = useState({ open: true });
+  const [appliedPromos, setAppliedPromos] = useState([]);
+  const [promoDiscount, setPromoDiscount] = useState(0);
+  const scanBufferRef = useRef({ chars: "", lastAt: 0 });
 
   const load = async () => {
-    const [pr, st] = await Promise.all([api.get("/products"), api.get("/settings")]);
+    const [pr, st, sh] = await Promise.all([api.get("/products"), api.get("/settings"), api.get("/shifts/current")]);
     setProducts(pr.data);
     setStore(st.data.store);
+    setShiftStatus(sh.data);
   };
   useEffect(() => { load(); }, []);
+
+  // Physical barcode scanner: capture rapid keypress sequences ending with Enter
+  useEffect(() => {
+    const onKey = async (e) => {
+      // Skip if user is typing in input/textarea
+      const tag = (e.target?.tagName || "").toLowerCase();
+      if (tag === "input" || tag === "textarea" || e.target?.isContentEditable) return;
+      const now = Date.now();
+      const buf = scanBufferRef.current;
+      if (now - buf.lastAt > 300) buf.chars = "";
+      buf.lastAt = now;
+      if (e.key === "Enter") {
+        const code = buf.chars.trim();
+        buf.chars = "";
+        if (code.length >= 3) {
+          try {
+            const r = await api.get(`/products/by-sku/${encodeURIComponent(code)}`);
+            addToCart(r.data);
+            try { new Audio("data:audio/wav;base64,UklGRnQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YVAAAAA=").play().catch(() => {}); } catch {}
+            toast.success(`✓ ${r.data.name}`);
+          } catch {
+            toast.error(`Barcode ${code} tidak dikenal`);
+          }
+        }
+        return;
+      }
+      if (/^[a-zA-Z0-9-]$/.test(e.key)) buf.chars += e.key;
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [products]);
 
   const categories = useMemo(() => ["all", ...Array.from(new Set(products.map(p => p.category)))], [products]);
   const filtered = useMemo(() => products.filter(p =>
@@ -69,9 +106,26 @@ export default function POS() {
   const removeItem = (pid) => setCart(c => c.filter(x => x.product_id !== pid));
 
   const subtotal = cart.reduce((s, x) => s + x.price * x.qty, 0);
-  const totalDiscount = cart.reduce((s, x) => s + (x.discount || 0), 0);
-  const total = subtotal - totalDiscount;
+  const totalDiscount = cart.reduce((s, x) => s + (x.discount || 0), 0) + promoDiscount;
+  const total = Math.max(0, subtotal - totalDiscount);
   const change = Math.max(0, (Number(cashAmount) || 0) - total);
+
+  // Preview promotions whenever cart changes
+  useEffect(() => {
+    let cancelled = false;
+    if (cart.length === 0) { setPromoDiscount(0); setAppliedPromos([]); return; }
+    (async () => {
+      try {
+        const r = await api.post("/promotions/preview", {
+          items: cart.map(x => ({ product_id: x.product_id, name: x.name, qty: x.qty, price: x.price }))
+        });
+        if (cancelled) return;
+        setPromoDiscount(r.data.total_discount || 0);
+        setAppliedPromos(r.data.applied || []);
+      } catch {}
+    })();
+    return () => { cancelled = true; };
+  }, [cart]);
 
   const finishTx = async (method, extra = {}) => {
     const payload = {
@@ -80,6 +134,7 @@ export default function POS() {
       payment_method: method,
       cash_tendered: method === "cash" ? Number(cashAmount) || total : total,
       change: method === "cash" ? change : 0,
+      applied_promos: appliedPromos,
       ...extra,
     };
     const r = await api.post("/transactions", payload);
@@ -111,8 +166,13 @@ export default function POS() {
       <div className="flex items-center justify-between gap-4">
         <div>
           <h1 className="font-display text-3xl md:text-4xl font-black tracking-tighter">Kasir</h1>
-          <p className="text-sm text-muted-foreground">Pilih produk, lalu bayar.</p>
+          <p className="text-sm text-muted-foreground">Pilih produk, atau tap Scan / gunakan barcode scanner fisik.</p>
         </div>
+        {!shiftStatus.open && (
+          <a href="/shifts" className="text-xs px-3 py-1.5 rounded-full bg-yellow-100 text-yellow-800 dark:bg-yellow-950/50 dark:text-yellow-300 border border-yellow-500/40" data-testid="shift-warning">
+            ⚠ Shift belum dibuka
+          </a>
+        )}
       </div>
 
       <div className="grid lg:grid-cols-[1fr_380px] gap-4">
@@ -175,11 +235,11 @@ export default function POS() {
         {/* Cart desktop */}
         <div className="hidden lg:block">
           <CartCard cart={cart} changeQty={changeQty} removeItem={removeItem}
-                    subtotal={subtotal} total={total} onPay={() => setCartOpen(true)} />
+                    subtotal={subtotal} total={total} onPay={() => setCartOpen(true)}
+                    appliedPromos={appliedPromos} promoDiscount={promoDiscount} />
         </div>
       </div>
 
-      {/* Mobile floating cart button */}
       <div className="lg:hidden fixed bottom-20 right-4 z-40">
         <Sheet open={cartOpen} onOpenChange={setCartOpen}>
           <SheetTrigger asChild>
@@ -191,7 +251,8 @@ export default function POS() {
           <SheetContent side="bottom" className="max-h-[90vh]">
             <SheetHeader><SheetTitle className="font-display">Keranjang</SheetTitle></SheetHeader>
             <CartCard cart={cart} changeQty={changeQty} removeItem={removeItem}
-                      subtotal={subtotal} total={total} onPay={() => setPayMode("choose")} inSheet />
+                      subtotal={subtotal} total={total} onPay={() => setPayMode("choose")} inSheet
+                      appliedPromos={appliedPromos} promoDiscount={promoDiscount} />
           </SheetContent>
         </Sheet>
       </div>
@@ -277,12 +338,12 @@ export default function POS() {
   );
 }
 
-function CartCard({ cart, changeQty, removeItem, subtotal, total, onPay, inSheet }) {
+function CartCard({ cart, changeQty, removeItem, subtotal, total, onPay, inSheet, appliedPromos = [], promoDiscount = 0 }) {
   return (
     <div className={inSheet ? "" : "sticky top-4 border border-border/70 rounded-lg bg-card"}>
       <div className={inSheet ? "space-y-3 mt-2" : "p-4 space-y-3"}>
         {!inSheet && <div className="font-display font-black tracking-tight">Keranjang</div>}
-        <div className="space-y-2 max-h-[50vh] overflow-y-auto pr-1">
+        <div className="space-y-2 max-h-[40vh] overflow-y-auto pr-1">
           {cart.length === 0 && <div className="text-sm text-muted-foreground text-center py-8">Belum ada item.</div>}
           {cart.map(x => (
             <div key={x.product_id} className="flex items-center gap-2 py-2 border-b border-border/50" data-testid={`cart-item-${x.product_id}`}>
@@ -301,6 +362,12 @@ function CartCard({ cart, changeQty, removeItem, subtotal, total, onPay, inSheet
         </div>
         <div className="pt-2 border-t border-border/60 space-y-1 text-sm">
           <div className="flex justify-between text-muted-foreground"><span>Subtotal</span><span>{formatIDR(subtotal)}</span></div>
+          {appliedPromos.map((p, i) => (
+            <div key={i} className="flex justify-between text-emerald-600 text-xs" data-testid={`applied-promo-${i}`}>
+              <span>🎁 {p.name}</span>
+              <span>{p.free_delivery ? "Gratis Ongkir" : `-${formatIDR(p.discount || 0)}`}</span>
+            </div>
+          ))}
           <div className="flex justify-between items-baseline">
             <span className="text-xs uppercase tracking-widest text-muted-foreground">Total</span>
             <span className="font-display font-black text-2xl text-primary tracking-tight" data-testid="cart-total">{formatIDR(total)}</span>

@@ -7,10 +7,11 @@ import { Input } from "../components/ui/input";
 import { Label } from "../components/ui/label";
 import { Badge } from "../components/ui/badge";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "../components/ui/dialog";
-import { Plus, Pencil, Trash2, AlertTriangle, Search, Package, Upload, Loader2, ScanBarcode } from "lucide-react";
+import { Plus, Pencil, Trash2, AlertTriangle, Search, Package, Upload, Loader2, ScanBarcode, Download } from "lucide-react";
 import { toast } from "sonner";
 import imageCompression from "browser-image-compression";
 import BarcodeScanner from "../components/BarcodeScanner";
+import { API_BASE } from "../lib/api";
 
 const empty = { name: "", category: "", stock: 0, buy_price: 0, sell_price: 0, sku: "", image_url: "" };
 
@@ -79,6 +80,11 @@ export default function Inventory() {
         <Button onClick={()=>{setForm(empty); setEditing(null); setOpen(true);}} data-testid="add-product-btn" className="tap">
           <Plus className="h-4 w-4 mr-1" /> Tambah Produk
         </Button>
+        <a href={`${API_BASE}/exports/inventory.xlsx`} target="_blank" rel="noopener noreferrer">
+          <Button variant="outline" className="tap" data-testid="export-inv-btn">
+            <Download className="h-4 w-4 mr-1" /> Export
+          </Button>
+        </a>
       </div>
 
       {lowCount > 0 && (
