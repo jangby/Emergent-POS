@@ -5,19 +5,21 @@ import { Input } from "../components/ui/input";
 import { Label } from "../components/ui/label";
 import { Button } from "../components/ui/button";
 import { Select, SelectTrigger, SelectContent, SelectItem, SelectValue } from "../components/ui/select";
-import { Printer, Bluetooth, Store, KeyRound, CheckCircle2 } from "lucide-react";
+import { Printer, Bluetooth, Store, KeyRound, CheckCircle2, MessageCircle } from "lucide-react";
 import { toast } from "sonner";
 import { connectPrinter, printTest, isBluetoothSupported, getConnectedPrinter } from "../lib/bluetooth";
 
 export default function Settings() {
   const [store, setStore] = useState({ name: "", address: "", phone: "", footer: "" });
   const [mt, setMt] = useState({ mode: "sandbox", merchant_id: "", client_key: "", server_key: "", configured: false });
+  const [fn, setFn] = useState({ token: "", configured: false });
   const [printer, setPrinter] = useState(getConnectedPrinter());
 
   useEffect(() => { (async () => {
     const r = await api.get("/settings");
     setStore(r.data.store);
     setMt({ ...r.data.midtrans, server_key: "" });
+    setFn({ token: "", configured: !!r.data.fonnte?.configured });
   })(); }, []);
 
   const saveStore = async () => { await api.put("/settings/store", store); toast.success("Profil toko tersimpan"); };
@@ -28,6 +30,13 @@ export default function Settings() {
     });
     toast.success("Konfigurasi Midtrans tersimpan");
     setMt(m => ({ ...m, configured: true, server_key: "" }));
+  };
+
+  const saveFn = async () => {
+    if (!fn.token || fn.token.length < 5) { toast.error("Token Fonnte tidak valid"); return; }
+    await api.put("/settings/fonnte", { token: fn.token });
+    toast.success("Token Fonnte tersimpan");
+    setFn({ token: "", configured: true });
   };
 
   const doPair = async () => {
@@ -85,6 +94,22 @@ export default function Settings() {
           </div>
         </div>
         <Button onClick={saveMt} className="tap" data-testid="save-mt">Simpan Konfigurasi</Button>
+      </Card>
+
+      <Card className="p-5 border-border/70 space-y-3">
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-2"><MessageCircle className="h-5 w-5 text-primary" /><span className="font-display font-black tracking-tight">WhatsApp (Fonnte)</span></div>
+          {fn.configured && <span className="text-xs flex items-center gap-1 text-emerald-600"><CheckCircle2 className="h-3 w-3" /> Terkonfigurasi</span>}
+        </div>
+        <p className="text-xs text-muted-foreground">
+          Dapatkan device token di dashboard fonnte.com → Device. Token akan disimpan terenkripsi dan digunakan untuk mengirim struk / notifikasi WA.
+        </p>
+        <div>
+          <Label>Device Token {fn.configured && <span className="text-muted-foreground text-xs">(isi ulang untuk mengganti)</span>}</Label>
+          <Input type="password" value={fn.token} onChange={(e)=>setFn({...fn, token:e.target.value})}
+                 placeholder={fn.configured ? "•••• tersimpan" : "Fonnte device token"} data-testid="fn-token" />
+        </div>
+        <Button onClick={saveFn} className="tap" data-testid="save-fn">Simpan Token WhatsApp</Button>
       </Card>
 
       <Card className="p-5 border-border/70 space-y-3">

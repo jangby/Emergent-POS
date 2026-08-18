@@ -6,7 +6,7 @@ import { Input } from "../components/ui/input";
 import { Button } from "../components/ui/button";
 import { Badge } from "../components/ui/badge";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "../components/ui/dialog";
-import { Search, Printer, Receipt } from "lucide-react";
+import { Search, Printer, Receipt, MessageCircle, Send } from "lucide-react";
 import { printReceipt, printReceiptWeb, isBluetoothSupported } from "../lib/bluetooth";
 import { toast } from "sonner";
 
@@ -15,6 +15,8 @@ export default function Transactions() {
   const [q, setQ] = useState("");
   const [detail, setDetail] = useState(null);
   const [store, setStore] = useState({});
+  const [waTarget, setWaTarget] = useState("");
+  const [waSending, setWaSending] = useState(false);
 
   const load = async () => {
     const [t, s] = await Promise.all([api.get("/transactions", { params: { days: 30, q: q || undefined } }),
@@ -31,6 +33,18 @@ export default function Transactions() {
       catch { toast.error("Bluetooth gagal, cetak web."); }
     }
     printReceiptWeb({ store, tx });
+  };
+
+  const sendWA = async () => {
+    if (!waTarget.trim() || !detail) return;
+    setWaSending(true);
+    try {
+      await api.post("/whatsapp/send-receipt", { target: waTarget, transaction_id: detail.id });
+      toast.success("Struk terkirim via WhatsApp");
+      setWaTarget("");
+    } catch (e) {
+      toast.error(e.response?.data?.detail || "Gagal kirim WA");
+    } finally { setWaSending(false); }
   };
 
   return (
@@ -89,6 +103,17 @@ export default function Transactions() {
               <Button className="w-full tap" onClick={()=>doPrint(detail)} data-testid="reprint-btn">
                 <Printer className="h-4 w-4 mr-2" /> Cetak Ulang Struk
               </Button>
+              <div className="pt-2 border-t border-border/60 space-y-2">
+                <div className="flex items-center gap-2 text-xs text-muted-foreground uppercase tracking-widest">
+                  <MessageCircle className="h-3 w-3" /> Kirim ke WhatsApp
+                </div>
+                <div className="flex gap-2">
+                  <Input placeholder="628123..." value={waTarget} onChange={(e)=>setWaTarget(e.target.value)} data-testid="wa-target" />
+                  <Button variant="outline" onClick={sendWA} disabled={!waTarget.trim() || waSending} data-testid="wa-send-btn">
+                    <Send className="h-4 w-4" />
+                  </Button>
+                </div>
+              </div>
             </div>
           )}
         </DialogContent>

@@ -11,6 +11,7 @@ import Transactions from "./pages/Transactions";
 import Analytics from "./pages/Analytics";
 import Settings from "./pages/Settings";
 import RestockAI from "./pages/RestockAI";
+import WhatsAppOrder from "./pages/WhatsAppOrder";
 import { Toaster } from "./components/ui/sonner";
 
 export default function App() {
@@ -23,6 +24,7 @@ export default function App() {
             <Route path="/" element={<ProtectedRoute><Layout><POS /></Layout></ProtectedRoute>} />
             <Route path="/inventory" element={<ProtectedRoute><Layout><Inventory /></Layout></ProtectedRoute>} />
             <Route path="/restock" element={<ProtectedRoute><Layout><RestockAI /></Layout></ProtectedRoute>} />
+            <Route path="/wa-orders" element={<ProtectedRoute><Layout><WhatsAppOrder /></Layout></ProtectedRoute>} />
             <Route path="/transactions" element={<ProtectedRoute><Layout><Transactions /></Layout></ProtectedRoute>} />
             <Route path="/analytics" element={<ProtectedRoute><Layout><Analytics /></Layout></ProtectedRoute>} />
             <Route path="/settings" element={<ProtectedRoute><Layout><Settings /></Layout></ProtectedRoute>} />

@@ -7,9 +7,10 @@ import { Badge } from "../components/ui/badge";
 import { Card } from "../components/ui/card";
 import { Sheet, SheetContent, SheetHeader, SheetTitle, SheetTrigger } from "../components/ui/sheet";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "../components/ui/dialog";
-import { Search, Plus, Minus, Trash2, ShoppingCart, Banknote, QrCode, Printer, X, Package, CheckCircle2 } from "lucide-react";
+import { Search, Plus, Minus, Trash2, ShoppingCart, Banknote, QrCode, Printer, X, Package, CheckCircle2, ScanBarcode } from "lucide-react";
 import { toast } from "sonner";
 import QRISDialog from "../components/QRISDialog";
+import BarcodeScanner from "../components/BarcodeScanner";
 import { connectPrinter, printReceipt, printReceiptWeb, isBluetoothSupported } from "../lib/bluetooth";
 
 export default function POS() {
@@ -23,6 +24,7 @@ export default function POS() {
   const [qrisOrderId, setQrisOrderId] = useState(null);
   const [store, setStore] = useState({});
   const [completedTx, setCompletedTx] = useState(null);
+  const [scannerOpen, setScannerOpen] = useState(false);
 
   const load = async () => {
     const [pr, st] = await Promise.all([api.get("/products"), api.get("/settings")]);
@@ -47,6 +49,21 @@ export default function POS() {
       }
       return [...c, { product_id: p.id, name: p.name, qty: 1, price: p.sell_price, buy_price: p.buy_price, discount: 0, stock: p.stock }];
     });
+  };
+
+  const onBarcodeDetected = async (code) => {
+    setScannerOpen(false);
+    try {
+      const r = await api.get(`/products/by-sku/${encodeURIComponent(code)}`);
+      addToCart(r.data);
+      toast.success(`Ditambahkan: ${r.data.name}`);
+    } catch {
+      // fallback: search by name
+      const match = products.find(p => (p.sku || "").toLowerCase() === code.toLowerCase()
+                                       || p.name.toLowerCase().includes(code.toLowerCase()));
+      if (match) { addToCart(match); toast.success(`Ditambahkan: ${match.name}`); }
+      else toast.error(`Barcode ${code} tidak dikenal`);
+    }
   };
   const changeQty = (pid, d) => setCart(c => c.map(x => x.product_id === pid ? { ...x, qty: Math.max(1, Math.min(x.stock, x.qty + d)) } : x));
   const removeItem = (pid) => setCart(c => c.filter(x => x.product_id !== pid));
@@ -106,6 +123,9 @@ export default function POS() {
               <Input value={q} onChange={(e)=>setQ(e.target.value)} placeholder="Cari nama produk / SKU…"
                      className="pl-9" data-testid="pos-search" />
             </div>
+            <Button variant="outline" onClick={() => setScannerOpen(true)} className="tap" data-testid="scan-barcode-btn">
+              <ScanBarcode className="h-4 w-4 md:mr-1" /> <span className="hidden md:inline">Scan</span>
+            </Button>
           </div>
           <div className="flex gap-2 overflow-x-auto pb-1">
             {categories.map(c => (
@@ -231,6 +251,8 @@ export default function POS() {
                   amount={total} orderId={qrisOrderId || ""}
                   onPaid={(d) => finishTx("qris", { qris_order_id: qrisOrderId, qris_status: d.status })}
                   onCancel={()=>setPayMode(null)} />
+
+      <BarcodeScanner open={scannerOpen} onOpenChange={setScannerOpen} onDetect={onBarcodeDetected} />
 
       {/* Completed */}
       <Dialog open={!!completedTx} onOpenChange={(o)=>!o && setCompletedTx(null)}>

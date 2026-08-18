@@ -394,6 +394,150 @@ async def confirm_restock(body: RestockIn, user: dict = Depends(get_current_user
             created += 1
     return {"updated": updated, "created": created}
 
+# --- Barcode lookup ---
+@api.get("/products/by-sku/{sku}")
+async def product_by_sku(sku: str, user: dict = Depends(get_current_user)):
+    doc = await db.products.find_one({"sku": sku}, {"_id": 0})
+    if not doc:
+        raise HTTPException(404, "Produk tidak ditemukan")
+    return doc
+
+# --- WhatsApp / Fonnte ---
+class FonnteSettingsIn(BaseModel):
+    token: str = Field(min_length=5)
+
+class WASendIn(BaseModel):
+    target: str = Field(min_length=5)  # e.g. 628xxx
+    message: str = Field(min_length=1)
+
+class WASendReceiptIn(BaseModel):
+    target: str = Field(min_length=5)
+    transaction_id: str
+
+async def get_fonnte_token() -> str:
+    doc = await db.settings.find_one({"id": "default"}) or {}
+    tk_enc = doc.get("fonnte", {}).get("token_enc")
+    if not tk_enc:
+        raise HTTPException(400, "Fonnte belum dikonfigurasi di Pengaturan.")
+    return dec(tk_enc)
+
+def normalize_wa_target(t: str) -> str:
+    t = t.strip().replace("+", "").replace("-", "").replace(" ", "")
+    if t.startswith("0"):
+        t = "62" + t[1:]
+    return t
+
+@api.put("/settings/fonnte")
+async def save_fonnte(body: FonnteSettingsIn, user: dict = Depends(get_current_user)):
+    await db.settings.update_one({"id": "default"},
+                                 {"$set": {"id": "default", "fonnte": {
+                                     "token_enc": enc(body.token),
+                                     "updated_at": now_utc().isoformat(),
+                                 }}}, upsert=True)
+    return {"ok": True}
+
+@api.post("/whatsapp/send")
+async def wa_send(body: WASendIn, user: dict = Depends(get_current_user)):
+    token = await get_fonnte_token()
+    target = normalize_wa_target(body.target)
+    try:
+        async with httpx.AsyncClient(timeout=20) as hc:
+            r = await hc.post("https://api.fonnte.com/send",
+                              headers={"Authorization": token},
+                              data={"target": target, "message": body.message,
+                                    "countryCode": "62"})
+        data = r.json() if r.headers.get("content-type", "").startswith("application/json") else {"raw": r.text}
+    except Exception as e:
+        raise HTTPException(502, f"Gagal terhubung ke Fonnte: {str(e)}")
+    if not data.get("status"):
+        raise HTTPException(400, data.get("reason") or "Gagal mengirim WhatsApp")
+    return {"ok": True, "detail": data.get("detail"), "requestid": data.get("requestid")}
+
+def format_receipt_wa(store: dict, tx: dict) -> str:
+    def fmt(n): return "Rp" + f"{int(n or 0):,}".replace(",", ".")
+    lines = []
+    lines.append(f"*{store.get('name', 'Toko')}*")
+    if store.get("address"): lines.append(store["address"])
+    if store.get("phone"): lines.append(store["phone"])
+    lines.append("--------------------------------")
+    lines.append(f"No : {tx['order_id']}")
+    lines.append(f"Tgl: {datetime.fromisoformat(tx['created_at']).strftime('%d/%m/%Y %H:%M')}")
+    lines.append("--------------------------------")
+    for it in tx["items"]:
+        lines.append(f"{it['name']}")
+        lines.append(f"  {it['qty']} x {fmt(it['price'])} = {fmt(it['qty'] * it['price'])}")
+    lines.append("--------------------------------")
+    lines.append(f"Subtotal : {fmt(tx['subtotal'])}")
+    if tx.get("discount"): lines.append(f"Diskon   : -{fmt(tx['discount'])}")
+    if tx.get("tax"):      lines.append(f"Pajak    : {fmt(tx['tax'])}")
+    lines.append(f"*TOTAL    : {fmt(tx['total'])}*")
+    lines.append(f"Bayar ({tx.get('payment_method', '').upper()}): {fmt(tx.get('cash_tendered') or tx['total'])}")
+    if tx.get("change"): lines.append(f"Kembalian: {fmt(tx['change'])}")
+    lines.append("--------------------------------")
+    lines.append(store.get("footer", "Terima Kasih!"))
+    return "\n".join(lines)
+
+@api.post("/whatsapp/send-receipt")
+async def wa_send_receipt(body: WASendReceiptIn, user: dict = Depends(get_current_user)):
+    tx = await db.transactions.find_one({"id": body.transaction_id}, {"_id": 0})
+    if not tx:
+        raise HTTPException(404, "Transaksi tidak ditemukan")
+    st = await db.settings.find_one({"id": "default"}) or {}
+    store = st.get("store", {})
+    msg = format_receipt_wa(store, tx)
+    return await wa_send(WASendIn(target=body.target, message=msg), user)
+
+# --- AI Order Parser (parses free-text WA message into cart items) ---
+class OrderParseIn(BaseModel):
+    text: str = Field(min_length=1)
+
+@api.post("/ai/parse-order")
+async def parse_order(body: OrderParseIn, user: dict = Depends(get_current_user)):
+    try:
+        from emergentintegrations.llm.chat import LlmChat, UserMessage
+        products = await db.products.find({}, {"_id": 0}).to_list(500)
+        catalog = "\n".join([f"- {p['name']} (id={p['id']}, harga={p['sell_price']}, stok={p['stock']})" for p in products])
+
+        chat = LlmChat(
+            api_key=EMERGENT_LLM_KEY,
+            session_id=f"order-{uuid.uuid4()}",
+            system_message=(
+                "Kamu adalah AI yang memahami pesan pemesanan WhatsApp dari pelanggan toko UMKM Indonesia. "
+                "Diberikan katalog produk dan pesan bebas dari pelanggan, cocokkan item yang dipesan "
+                "berdasarkan nama yang mirip (misal 'indomie' cocok dengan 'Indomie Goreng'). "
+                "Balas ONLY JSON valid dalam format: "
+                '{"items":[{"product_id":"...","name":"...","qty":<int>}], "unmatched":["..."]}. '
+                "unmatched berisi item yang tidak ditemukan di katalog. "
+                "Jangan gunakan markdown."
+            )
+        ).with_model("gemini", "gemini-3-flash-preview")
+
+        prompt = f"KATALOG:\n{catalog}\n\nPESAN PELANGGAN:\n{body.text}"
+        result = await chat.send_message(UserMessage(text=prompt))
+        text = result if isinstance(result, str) else str(result)
+        import re, json
+        text = re.sub(r"^```(json)?", "", text.strip()).rstrip("`").strip()
+        m = re.search(r"\{.*\}", text, re.DOTALL)
+        parsed = json.loads(m.group(0)) if m else {"items": [], "unmatched": []}
+
+        # Enrich with current price & stock
+        by_id = {p["id"]: p for p in products}
+        enriched = []
+        for it in parsed.get("items", []):
+            pr = by_id.get(it.get("product_id"))
+            if pr:
+                enriched.append({
+                    "product_id": pr["id"], "name": pr["name"],
+                    "qty": int(it.get("qty", 1)),
+                    "price": pr["sell_price"], "buy_price": pr["buy_price"],
+                    "stock": pr["stock"],
+                })
+        return {"items": enriched, "unmatched": parsed.get("unmatched", [])}
+    except Exception as e:
+        logging.exception("Order parse failed")
+        raise HTTPException(500, f"AI gagal memahami pesan: {str(e)}")
+
+
 # --- AI Business Insights ---
 @api.get("/ai/insights")
 async def ai_insights(user: dict = Depends(get_current_user)):
@@ -448,6 +592,7 @@ async def get_settings(user: dict = Depends(get_current_user)):
     doc = await db.settings.find_one({"id": "default"}, {"_id": 0}) or {}
     store = doc.get("store", StoreProfile().model_dump())
     mt = doc.get("midtrans", {})
+    fn = doc.get("fonnte", {})
     return {
         "store": store,
         "midtrans": {
@@ -456,7 +601,10 @@ async def get_settings(user: dict = Depends(get_current_user)):
             "client_key": dec(mt.get("client_key_enc", "")),
             "server_key_masked": ("*" * 8 + dec(mt.get("server_key_enc", ""))[-4:]) if mt.get("server_key_enc") else "",
             "configured": bool(mt.get("server_key_enc")),
-        }
+        },
+        "fonnte": {
+            "configured": bool(fn.get("token_enc")),
+        },
     }
 
 @api.put("/settings/store")

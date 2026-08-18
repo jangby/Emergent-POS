@@ -1,7 +1,7 @@
 import { NavLink, useNavigate } from "react-router-dom";
 import {
   ShoppingCart, Package, ScanLine, Receipt, BarChart3, Settings as Cog,
-  Sun, Moon, LogOut, Sparkles
+  Sun, Moon, LogOut, Sparkles, MessageCircle
 } from "lucide-react";
 import { useAuth } from "../context/AuthContext";
 import { useTheme } from "../context/ThemeContext";
@@ -11,6 +11,7 @@ const NAV = [
   { to: "/", label: "Kasir", icon: ShoppingCart, testid: "nav-pos" },
   { to: "/inventory", label: "Produk", icon: Package, testid: "nav-inventory" },
   { to: "/restock", label: "Scan Nota", icon: ScanLine, testid: "nav-restock" },
+  { to: "/wa-orders", label: "Pesanan WA", icon: MessageCircle, testid: "nav-wa" },
   { to: "/transactions", label: "Riwayat", icon: Receipt, testid: "nav-transactions" },
   { to: "/analytics", label: "Analitik", icon: BarChart3, testid: "nav-analytics" },
   { to: "/settings", label: "Pengaturan", icon: Cog, testid: "nav-settings" },
@@ -93,7 +94,7 @@ export default function Layout({ children }) {
 
       {/* Bottom Nav (mobile) */}
       <nav className="md:hidden fixed bottom-0 left-0 right-0 z-50 backdrop-blur-xl bg-background/85 border-t border-border/60">
-        <div className="grid grid-cols-6">
+        <div className="grid grid-cols-7">
           {NAV.map((n) => (
             <NavLink key={n.to} to={n.to} end={n.to === "/"} data-testid={`${n.testid}-mobile`}
                      className={({ isActive }) =>

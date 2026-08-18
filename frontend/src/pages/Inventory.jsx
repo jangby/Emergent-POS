@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import api from "../lib/api";
 import { formatIDR } from "../lib/format";
 import { Card } from "../components/ui/card";
@@ -7,8 +7,10 @@ import { Input } from "../components/ui/input";
 import { Label } from "../components/ui/label";
 import { Badge } from "../components/ui/badge";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "../components/ui/dialog";
-import { Plus, Pencil, Trash2, AlertTriangle, Search, Package } from "lucide-react";
+import { Plus, Pencil, Trash2, AlertTriangle, Search, Package, Upload, Loader2, ScanBarcode } from "lucide-react";
 import { toast } from "sonner";
+import imageCompression from "browser-image-compression";
+import BarcodeScanner from "../components/BarcodeScanner";
 
 const empty = { name: "", category: "", stock: 0, buy_price: 0, sell_price: 0, sku: "", image_url: "" };
 
@@ -18,12 +20,31 @@ export default function Inventory() {
   const [open, setOpen] = useState(false);
   const [form, setForm] = useState(empty);
   const [editing, setEditing] = useState(null);
+  const [uploading, setUploading] = useState(false);
+  const [scanOpen, setScanOpen] = useState(false);
+  const fileRef = useRef(null);
 
   const load = async () => {
     const r = await api.get("/products");
     setItems(r.data);
   };
   useEffect(() => { load(); }, []);
+
+  const onPickImage = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setUploading(true);
+    try {
+      const compressed = await imageCompression(file, {
+        maxSizeMB: 0.4, maxWidthOrHeight: 800, useWebWorker: true, fileType: "image/jpeg", initialQuality: 0.75
+      });
+      const dataUrl = await imageCompression.getDataUrlFromFile(compressed);
+      setForm(f => ({ ...f, image_url: dataUrl }));
+      toast.success("Gambar diunggah");
+    } catch (err) {
+      toast.error("Gagal mengompres gambar");
+    } finally { setUploading(false); }
+  };
 
   const save = async () => {
     const payload = {
@@ -114,17 +135,44 @@ export default function Inventory() {
             <div><Label>Kategori</Label><Input value={form.category} onChange={(e)=>setForm({...form, category:e.target.value})} data-testid="form-cat" /></div>
             <div className="grid grid-cols-2 gap-2">
               <div><Label>Stok</Label><Input type="number" value={form.stock} onChange={(e)=>setForm({...form, stock:e.target.value})} data-testid="form-stock" /></div>
-              <div><Label>SKU/Barcode</Label><Input value={form.sku || ""} onChange={(e)=>setForm({...form, sku:e.target.value})} /></div>
+              <div>
+                <Label>SKU/Barcode</Label>
+                <div className="flex gap-1">
+                  <Input value={form.sku || ""} onChange={(e)=>setForm({...form, sku:e.target.value})} data-testid="form-sku" />
+                  <Button size="icon" variant="outline" type="button" onClick={()=>setScanOpen(true)} data-testid="form-scan-sku">
+                    <ScanBarcode className="h-4 w-4" />
+                  </Button>
+                </div>
+              </div>
             </div>
             <div className="grid grid-cols-2 gap-2">
               <div><Label>Harga Modal</Label><Input type="number" value={form.buy_price} onChange={(e)=>setForm({...form, buy_price:e.target.value})} data-testid="form-buy" /></div>
               <div><Label>Harga Jual</Label><Input type="number" value={form.sell_price} onChange={(e)=>setForm({...form, sell_price:e.target.value})} data-testid="form-sell" /></div>
             </div>
-            <div><Label>URL Gambar</Label><Input value={form.image_url || ""} onChange={(e)=>setForm({...form, image_url:e.target.value})} /></div>
+            <div>
+              <Label>Gambar Produk</Label>
+              <div className="flex items-center gap-3">
+                <div className="w-20 h-20 rounded-md bg-secondary shrink-0 overflow-hidden border border-border/60">
+                  {form.image_url ? <img src={form.image_url} alt="preview" className="w-full h-full object-cover" /> :
+                    <div className="w-full h-full flex items-center justify-center text-muted-foreground"><Package className="h-6 w-6" /></div>}
+                </div>
+                <div className="flex-1">
+                  <Button type="button" variant="outline" onClick={()=>fileRef.current?.click()} disabled={uploading} className="w-full tap" data-testid="form-upload-img">
+                    {uploading ? <Loader2 className="h-4 w-4 animate-spin" /> : <><Upload className="h-4 w-4 mr-1" /> Unggah Foto</>}
+                  </Button>
+                  <input ref={fileRef} type="file" accept="image/*" capture="environment" onChange={onPickImage} className="hidden" />
+                  <Input placeholder="atau tempel URL gambar" value={form.image_url && form.image_url.startsWith("http") ? form.image_url : ""}
+                         onChange={(e)=>setForm({...form, image_url:e.target.value})} className="mt-2 text-xs" />
+                </div>
+              </div>
+            </div>
             <Button onClick={save} className="w-full tap" data-testid="form-save">Simpan</Button>
           </div>
         </DialogContent>
       </Dialog>
+
+      <BarcodeScanner open={scanOpen} onOpenChange={setScanOpen}
+        onDetect={(code) => { setForm(f => ({...f, sku: code})); setScanOpen(false); toast.success(`SKU: ${code}`); }} />
     </div>
   );
 }
