@@ -7,10 +7,9 @@ import { Badge } from "../components/ui/badge";
 import { Card } from "../components/ui/card";
 import { Sheet, SheetContent, SheetHeader, SheetTitle, SheetTrigger } from "../components/ui/sheet";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "../components/ui/dialog";
-import { Search, Plus, Minus, Trash2, ShoppingCart, Banknote, QrCode, Printer, X, Package, CheckCircle2, ScanBarcode } from "lucide-react";
+import { Search, Plus, Minus, Trash2, ShoppingCart, Banknote, QrCode, Printer, X, Package, CheckCircle2, Barcode } from "lucide-react";
 import { toast } from "sonner";
 import QRISDialog from "../components/QRISDialog";
-import BarcodeScanner from "../components/BarcodeScanner";
 import { connectPrinter, printReceipt, printReceiptWeb, isBluetoothSupported } from "../lib/bluetooth";
 
 export default function POS() {
@@ -24,11 +23,13 @@ export default function POS() {
   const [qrisOrderId, setQrisOrderId] = useState(null);
   const [store, setStore] = useState({});
   const [completedTx, setCompletedTx] = useState(null);
-  const [scannerOpen, setScannerOpen] = useState(false);
   const [shiftStatus, setShiftStatus] = useState({ open: true });
   const [appliedPromos, setAppliedPromos] = useState([]);
   const [promoDiscount, setPromoDiscount] = useState(0);
+  const [manualBarcode, setManualBarcode] = useState("");
+  const barcodeInputRef = useRef(null);
   const scanBufferRef = useRef({ chars: "", lastAt: 0 });
+  const audioCtxRef = useRef(null);
 
   const load = async () => {
     const [pr, st, sh] = await Promise.all([api.get("/products"), api.get("/settings"), api.get("/shifts/current")]);
@@ -39,36 +40,75 @@ export default function POS() {
   useEffect(() => { load(); }, []);
 
   // Physical barcode scanner: capture rapid keypress sequences ending with Enter
+  const beep = () => {
+    try {
+      if (!audioCtxRef.current) audioCtxRef.current = new (window.AudioContext || window.webkitAudioContext)();
+      const ctx = audioCtxRef.current;
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = "square"; osc.frequency.value = 1200;
+      gain.gain.value = 0.15;
+      osc.connect(gain).connect(ctx.destination);
+      osc.start();
+      osc.stop(ctx.currentTime + 0.08);
+    } catch {}
+  };
+
+  const lookupBarcode = async (code) => {
+    const clean = (code || "").trim();
+    if (clean.length < 2) return;
+    try {
+      const r = await api.get(`/products/by-sku/${encodeURIComponent(clean)}`);
+      addToCart(r.data);
+      beep();
+      toast.success(`✓ ${r.data.name}`, { duration: 1500 });
+    } catch {
+      toast.error(`Produk dengan Barcode ${clean} tidak ditemukan`, { duration: 2200 });
+    }
+  };
+
   useEffect(() => {
     const onKey = async (e) => {
-      // Skip if user is typing in input/textarea
+      // Ignore keys typed inside inputs/textareas EXCEPT the dedicated barcode input
       const tag = (e.target?.tagName || "").toLowerCase();
-      if (tag === "input" || tag === "textarea" || e.target?.isContentEditable) return;
+      const isBarcodeInput = e.target === barcodeInputRef.current;
+      if (!isBarcodeInput && (tag === "input" || tag === "textarea" || e.target?.isContentEditable)) return;
       const now = Date.now();
       const buf = scanBufferRef.current;
-      if (now - buf.lastAt > 300) buf.chars = "";
+      if (now - buf.lastAt > 100) buf.chars = "";
       buf.lastAt = now;
       if (e.key === "Enter") {
         const code = buf.chars.trim();
         buf.chars = "";
-        if (code.length >= 3) {
-          try {
-            const r = await api.get(`/products/by-sku/${encodeURIComponent(code)}`);
-            addToCart(r.data);
-            try { new Audio("data:audio/wav;base64,UklGRnQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YVAAAAA=").play().catch(() => {}); } catch {}
-            toast.success(`✓ ${r.data.name}`);
-          } catch {
-            toast.error(`Barcode ${code} tidak dikenal`);
-          }
+        if (code.length >= 2) {
+          e.preventDefault();
+          await lookupBarcode(code);
+          // Refocus manual input so cashier can keep scanning
+          barcodeInputRef.current?.focus();
+          setManualBarcode("");
         }
         return;
       }
-      if (/^[a-zA-Z0-9-]$/.test(e.key)) buf.chars += e.key;
+      if (e.key.length === 1 && /[a-zA-Z0-9\-_]/.test(e.key)) buf.chars += e.key;
     };
     window.addEventListener("keydown", onKey);
+    // Autofocus the manual barcode input on mount
+    setTimeout(() => barcodeInputRef.current?.focus(), 300);
     return () => window.removeEventListener("keydown", onKey);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [products]);
+
+  // Keep barcode input focused when user clicks anywhere in POS (except other inputs/buttons)
+  useEffect(() => {
+    const refocus = (e) => {
+      const tag = (e.target?.tagName || "").toLowerCase();
+      if (["input", "textarea", "button", "select", "a"].includes(tag)) return;
+      if (e.target?.closest("[data-no-refocus]")) return;
+      barcodeInputRef.current?.focus();
+    };
+    document.addEventListener("click", refocus);
+    return () => document.removeEventListener("click", refocus);
+  }, []);
 
   const categories = useMemo(() => ["all", ...Array.from(new Set(products.map(p => p.category)))], [products]);
   const filtered = useMemo(() => products.filter(p =>
@@ -88,20 +128,14 @@ export default function POS() {
     });
   };
 
-  const onBarcodeDetected = async (code) => {
-    setScannerOpen(false);
-    try {
-      const r = await api.get(`/products/by-sku/${encodeURIComponent(code)}`);
-      addToCart(r.data);
-      toast.success(`Ditambahkan: ${r.data.name}`);
-    } catch {
-      // fallback: search by name
-      const match = products.find(p => (p.sku || "").toLowerCase() === code.toLowerCase()
-                                       || p.name.toLowerCase().includes(code.toLowerCase()));
-      if (match) { addToCart(match); toast.success(`Ditambahkan: ${match.name}`); }
-      else toast.error(`Barcode ${code} tidak dikenal`);
-    }
+  const onBarcodeSubmit = async (e) => {
+    e.preventDefault();
+    if (!manualBarcode.trim()) return;
+    await lookupBarcode(manualBarcode);
+    setManualBarcode("");
+    barcodeInputRef.current?.focus();
   };
+
   const changeQty = (pid, d) => setCart(c => c.map(x => x.product_id === pid ? { ...x, qty: Math.max(1, Math.min(x.stock, x.qty + d)) } : x));
   const removeItem = (pid) => setCart(c => c.filter(x => x.product_id !== pid));
 
@@ -166,7 +200,7 @@ export default function POS() {
       <div className="flex items-center justify-between gap-4">
         <div>
           <h1 className="font-display text-3xl md:text-4xl font-black tracking-tighter">Kasir</h1>
-          <p className="text-sm text-muted-foreground">Pilih produk, atau tap Scan / gunakan barcode scanner fisik.</p>
+          <p className="text-sm text-muted-foreground">Scan barcode fisik — atau ketik manual di kolom bawah.</p>
         </div>
         {!shiftStatus.open && (
           <a href="/shifts" className="text-xs px-3 py-1.5 rounded-full bg-yellow-100 text-yellow-800 dark:bg-yellow-950/50 dark:text-yellow-300 border border-yellow-500/40" data-testid="shift-warning">
@@ -174,6 +208,23 @@ export default function POS() {
           </a>
         )}
       </div>
+
+      {/* Dedicated barcode input — auto-focused, receives physical scanner input */}
+      <form onSubmit={onBarcodeSubmit} className="sticky top-0 z-30 -mx-4 px-4 md:mx-0 md:px-0 py-2 bg-background/95 backdrop-blur">
+        <div className="relative">
+          <Barcode className="absolute left-3 top-1/2 -translate-y-1/2 h-5 w-5 text-primary" />
+          <Input
+            ref={barcodeInputRef}
+            value={manualBarcode}
+            onChange={(e) => setManualBarcode(e.target.value)}
+            placeholder="Scan atau Ketik Barcode/SKU Manual… (auto-focus)"
+            className="pl-11 pr-4 h-12 text-base font-mono border-2 border-primary/40 focus:border-primary shadow-sm"
+            data-testid="barcode-input"
+            autoComplete="off"
+            spellCheck={false}
+          />
+        </div>
+      </form>
 
       <div className="grid lg:grid-cols-[1fr_380px] gap-4">
         <div className="space-y-3">
@@ -183,9 +234,6 @@ export default function POS() {
               <Input value={q} onChange={(e)=>setQ(e.target.value)} placeholder="Cari nama produk / SKU…"
                      className="pl-9" data-testid="pos-search" />
             </div>
-            <Button variant="outline" onClick={() => setScannerOpen(true)} className="tap" data-testid="scan-barcode-btn">
-              <ScanBarcode className="h-4 w-4 md:mr-1" /> <span className="hidden md:inline">Scan</span>
-            </Button>
           </div>
           <div className="flex gap-2 overflow-x-auto pb-1">
             {categories.map(c => (
@@ -312,8 +360,6 @@ export default function POS() {
                   amount={total} orderId={qrisOrderId || ""}
                   onPaid={(d) => finishTx("qris", { qris_order_id: qrisOrderId, qris_status: d.status })}
                   onCancel={()=>setPayMode(null)} />
-
-      <BarcodeScanner open={scannerOpen} onOpenChange={setScannerOpen} onDetect={onBarcodeDetected} />
 
       {/* Completed */}
       <Dialog open={!!completedTx} onOpenChange={(o)=>!o && setCompletedTx(null)}>
