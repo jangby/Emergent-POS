@@ -16,6 +16,10 @@ import OnlineOrders from "./pages/OnlineOrders";
 import Shifts from "./pages/Shifts";
 import Promotions from "./pages/Promotions";
 import BarcodePrint from "./pages/BarcodePrint";
+import Customers from "./pages/Customers";
+import Expenses from "./pages/Expenses";
+import Bundles from "./pages/Bundles";
+import OfflineIndicator from "./components/OfflineIndicator";
 import { Toaster } from "./components/ui/sonner";
 
 export default function App() {
@@ -33,10 +37,14 @@ export default function App() {
             <Route path="/shifts" element={<ProtectedRoute><Layout><Shifts /></Layout></ProtectedRoute>} />
             <Route path="/promotions" element={<ProtectedRoute><Layout><Promotions /></Layout></ProtectedRoute>} />
             <Route path="/barcodes" element={<ProtectedRoute><Layout><BarcodePrint /></Layout></ProtectedRoute>} />
+            <Route path="/customers" element={<ProtectedRoute><Layout><Customers /></Layout></ProtectedRoute>} />
+            <Route path="/expenses" element={<ProtectedRoute><Layout><Expenses /></Layout></ProtectedRoute>} />
+            <Route path="/bundles" element={<ProtectedRoute><Layout><Bundles /></Layout></ProtectedRoute>} />
             <Route path="/transactions" element={<ProtectedRoute><Layout><Transactions /></Layout></ProtectedRoute>} />
             <Route path="/analytics" element={<ProtectedRoute><Layout><Analytics /></Layout></ProtectedRoute>} />
             <Route path="/settings" element={<ProtectedRoute><Layout><Settings /></Layout></ProtectedRoute>} />
           </Routes>
+          <OfflineIndicator />
           <Toaster position="top-right" richColors />
         </BrowserRouter>
       </AuthProvider>

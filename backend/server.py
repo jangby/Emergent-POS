@@ -229,12 +229,15 @@ class TransactionIn(BaseModel):
     discount: int = 0
     tax: int = 0
     total: int
-    payment_method: Literal["cash", "qris"]
+    payment_method: Literal["cash", "qris", "credit"]
     cash_tendered: int = 0
     change: int = 0
     qris_order_id: Optional[str] = None
     qris_status: Optional[str] = None
     applied_promos: List[dict] = []
+    customer_id: Optional[str] = None
+    customer_name: Optional[str] = None
+    customer_phone: Optional[str] = None
 
 @api.post("/transactions")
 async def create_transaction(body: TransactionIn, user: dict = Depends(get_current_user)):
@@ -245,6 +248,12 @@ async def create_transaction(body: TransactionIn, user: dict = Depends(get_curre
         net_profit += (it.price - it.buy_price) * it.qty - it.discount
     # Link to open shift, if any
     open_shift = await db.shifts.find_one({"user_id": user["id"], "status": "open"})
+    is_credit = body.payment_method == "credit"
+    status = "completed"
+    if is_credit:
+        status = "unpaid"
+    elif body.payment_method == "qris" and body.qris_status not in ("settlement", "capture"):
+        status = "pending"
     doc = {"id": tid, "order_id": order_id,
            "items": [i.model_dump() for i in body.items],
            "subtotal": body.subtotal, "discount": body.discount,
@@ -253,11 +262,14 @@ async def create_transaction(body: TransactionIn, user: dict = Depends(get_curre
            "cash_tendered": body.cash_tendered, "change": body.change,
            "qris_order_id": body.qris_order_id, "qris_status": body.qris_status,
            "applied_promos": body.applied_promos,
-           "status": "completed" if body.payment_method == "cash" or body.qris_status in ("settlement", "capture") else "pending",
+           "status": status,
            "net_profit": net_profit,
            "cashier": user["email"],
            "cashier_id": user["id"],
            "shift_id": open_shift["id"] if open_shift else None,
+           "customer_id": body.customer_id,
+           "customer_name": body.customer_name,
+           "customer_phone": body.customer_phone,
            "created_at": now_utc().isoformat()}
     await db.transactions.insert_one(doc)
 
@@ -266,6 +278,31 @@ async def create_transaction(body: TransactionIn, user: dict = Depends(get_curre
     for it in body.items:
         await db.products.update_one({"id": it.product_id}, {"$inc": {"stock": -it.qty}})
         pids.append(it.product_id)
+
+    # Credit: create/upsert customer and add debt ledger
+    if is_credit and body.customer_phone:
+        cust_id = body.customer_id
+        if not cust_id:
+            existing = await db.customers.find_one({"phone": body.customer_phone})
+            if existing:
+                cust_id = existing["id"]
+            else:
+                cust_id = str(uuid.uuid4())
+                await db.customers.insert_one({
+                    "id": cust_id, "name": body.customer_name or body.customer_phone,
+                    "phone": body.customer_phone, "total_debt": 0,
+                    "created_at": now_utc().isoformat()
+                })
+        await db.customers.update_one({"id": cust_id},
+                                      {"$inc": {"total_debt": body.total}})
+        await db.debt_ledger.insert_one({
+            "id": str(uuid.uuid4()), "customer_id": cust_id,
+            "transaction_id": tid, "order_id": order_id,
+            "type": "debit", "amount": body.total,
+            "created_at": now_utc().isoformat(),
+        })
+        doc["customer_id"] = cust_id
+
     # Low-stock WA alert (fire and forget)
     try:
         asyncio.create_task(check_low_stock_and_alert(pids))
@@ -454,6 +491,249 @@ async def import_products(file: UploadFile = File(...), user: dict = Depends(get
             errors += 1
             errs.append(f"Baris {r_idx}: {str(e)}")
     return {"created": created, "updated": updated, "errors": errors, "error_details": errs[:10]}
+
+# ============================================================
+# Customers / Debt Ledger / Expenses / AI Bundling
+# ============================================================
+
+# --- Customers & Debt ---
+class CustomerIn(BaseModel):
+    name: str
+    phone: str = ""
+    note: str = ""
+
+@api.get("/customers")
+async def list_customers(user: dict = Depends(get_current_user)):
+    return await db.customers.find({}, {"_id": 0}).sort("total_debt", -1).to_list(500)
+
+@api.post("/customers")
+async def create_customer(body: CustomerIn, user: dict = Depends(get_current_user)):
+    if body.phone:
+        existing = await db.customers.find_one({"phone": body.phone}, {"_id": 0})
+        if existing:
+            return existing
+    cid = str(uuid.uuid4())
+    doc = {"id": cid, **body.model_dump(), "total_debt": 0,
+           "created_at": now_utc().isoformat()}
+    await db.customers.insert_one(doc)
+    return strip_id(doc)
+
+@api.get("/customers/{cid}/ledger")
+async def customer_ledger(cid: str, user: dict = Depends(get_current_user)):
+    cust = await db.customers.find_one({"id": cid}, {"_id": 0})
+    if not cust:
+        raise HTTPException(404, "Pelanggan tidak ditemukan")
+    entries = await db.debt_ledger.find({"customer_id": cid}, {"_id": 0}).sort("created_at", -1).to_list(500)
+    txs = await db.transactions.find({"customer_id": cid}, {"_id": 0}).sort("created_at", -1).to_list(500)
+    return {"customer": cust, "entries": entries, "transactions": txs}
+
+class DebtPayIn(BaseModel):
+    amount: int = Field(gt=0)
+    method: Literal["cash", "qris"] = "cash"
+
+@api.post("/customers/{cid}/pay-debt")
+async def pay_debt(cid: str, body: DebtPayIn, user: dict = Depends(get_current_user)):
+    cust = await db.customers.find_one({"id": cid})
+    if not cust:
+        raise HTTPException(404, "Pelanggan tidak ditemukan")
+    pay = min(body.amount, cust.get("total_debt", 0))
+    await db.customers.update_one({"id": cid}, {"$inc": {"total_debt": -pay}})
+    await db.debt_ledger.insert_one({
+        "id": str(uuid.uuid4()), "customer_id": cid, "type": "credit",
+        "amount": pay, "method": body.method,
+        "created_at": now_utc().isoformat(),
+    })
+    # Mark related unpaid transactions as completed (oldest first) up to `pay` amount
+    remain = pay
+    unpaid = await db.transactions.find({"customer_id": cid, "status": "unpaid"},
+                                        {"_id": 0}).sort("created_at", 1).to_list(200)
+    for t in unpaid:
+        if remain <= 0:
+            break
+        if t["total"] <= remain:
+            await db.transactions.update_one({"id": t["id"]},
+                                             {"$set": {"status": "completed"}})
+            remain -= t["total"]
+    return {"paid": pay, "remaining_debt": cust.get("total_debt", 0) - pay}
+
+@api.post("/customers/{cid}/send-reminder")
+async def send_debt_reminder(cid: str, user: dict = Depends(get_current_user)):
+    cust = await db.customers.find_one({"id": cid})
+    if not cust:
+        raise HTTPException(404, "Pelanggan tidak ditemukan")
+    debt = cust.get("total_debt", 0)
+    if debt <= 0:
+        raise HTTPException(400, "Tidak ada utang aktif")
+    if not cust.get("phone"):
+        raise HTTPException(400, "Nomor WhatsApp pelanggan kosong")
+    # Try to create QRIS link
+    qr_url = None
+    try:
+        creds = await get_midtrans_creds()
+        oid = f"DEBT-{cid[:6].upper()}-{int(now_utc().timestamp())}"
+        payload = {"payment_type": "qris",
+                   "transaction_details": {"order_id": oid, "gross_amount": debt},
+                   "qris": {"acquirer": "gopay"}}
+        async with httpx.AsyncClient(timeout=20) as hc:
+            r = await hc.post(f"{midtrans_base(creds['mode'])}/v2/charge",
+                              json=payload, auth=(creds['server_key'], ""),
+                              headers={"Accept": "application/json"})
+        data = r.json()
+        for a in data.get("actions", []):
+            if a.get("name") in ("generate-qr-code-v2", "generate-qr-code"):
+                qr_url = a["url"]; break
+    except Exception:
+        logging.exception("QRIS for reminder failed")
+    st = await db.settings.find_one({"id": "default"}) or {}
+    store_name = st.get("store", {}).get("name", "Toko Kami")
+    debt_fmt = f"Rp{debt:,}".replace(",", ".")
+    msg = (f"Halo *{cust['name']}* 👋\n\n"
+           f"Terima kasih telah berbelanja di *{store_name}*. "
+           f"Kami ingin mengingatkan tagihan Anda saat ini sebesar *{debt_fmt}*.\n\n"
+           + ("Silakan bayar langsung via QRIS pada gambar terlampir 📱.\n\n" if qr_url else "")
+           + "Salam hangat,\nStaff Kami 🙏")
+    try:
+        await wa_send_raw(cust["phone"], msg, image_url=qr_url)
+    except Exception as e:
+        raise HTTPException(502, f"Gagal kirim WA: {str(e)}")
+    return {"ok": True, "amount": debt, "qr_url": qr_url}
+
+# --- Expenses ---
+class ExpenseIn(BaseModel):
+    name: str
+    category: str = "Umum"
+    amount: int = Field(gt=0)
+    date: Optional[str] = None
+    note: str = ""
+
+@api.get("/expenses")
+async def list_expenses(days: int = 30, user: dict = Depends(get_current_user)):
+    cutoff = (now_utc() - timedelta(days=days)).isoformat()
+    return await db.expenses.find({"date": {"$gte": cutoff}}, {"_id": 0}).sort("date", -1).to_list(500)
+
+@api.post("/expenses")
+async def create_expense(body: ExpenseIn, user: dict = Depends(get_current_user)):
+    eid = str(uuid.uuid4())
+    doc = {"id": eid, **body.model_dump(),
+           "date": body.date or now_utc().isoformat(),
+           "created_at": now_utc().isoformat(),
+           "created_by": user["email"]}
+    await db.expenses.insert_one(doc)
+    return strip_id(doc)
+
+@api.delete("/expenses/{eid}")
+async def delete_expense(eid: str, user: dict = Depends(get_current_user)):
+    await db.expenses.delete_one({"id": eid})
+    return {"ok": True}
+
+@api.get("/analytics/net-profit")
+async def net_profit(days: int = 30, user: dict = Depends(get_current_user)):
+    cutoff = (now_utc() - timedelta(days=days)).isoformat()
+    txs = await db.transactions.find({"created_at": {"$gte": cutoff},
+                                      "status": {"$in": ["completed", "unpaid"]}},
+                                     {"_id": 0}).to_list(5000)
+    revenue = sum(t["total"] for t in txs if t["status"] == "completed")
+    hpp = 0  # Cost of Goods Sold
+    for t in txs:
+        for it in t.get("items", []):
+            hpp += it.get("buy_price", 0) * it.get("qty", 0)
+    gross_profit = revenue - hpp
+    exp_docs = await db.expenses.find({"date": {"$gte": cutoff}}, {"_id": 0}).to_list(1000)
+    op_expenses = sum(e.get("amount", 0) for e in exp_docs)
+    exp_by_cat = {}
+    for e in exp_docs:
+        exp_by_cat.setdefault(e["category"], 0)
+        exp_by_cat[e["category"]] += e["amount"]
+    return {
+        "days": days,
+        "revenue": revenue,
+        "hpp": hpp,
+        "gross_profit": gross_profit,
+        "operational_expenses": op_expenses,
+        "net_profit": gross_profit - op_expenses,
+        "expenses_by_category": [{"category": k, "amount": v} for k, v in exp_by_cat.items()],
+        "outstanding_debt": sum(t["total"] for t in txs if t["status"] == "unpaid"),
+    }
+
+# --- AI Dynamic Bundling ---
+@api.get("/ai/suggest-bundles")
+async def suggest_bundles(user: dict = Depends(get_current_user)):
+    """AI detects slow-moving products and suggests bundles with popular ones."""
+    try:
+        # Compute movement over last 30 days
+        cutoff = (now_utc() - timedelta(days=30)).isoformat()
+        txs = await db.transactions.find({"created_at": {"$gte": cutoff},
+                                          "status": "completed"}, {"_id": 0}).to_list(5000)
+        sales_by_product = {}
+        for t in txs:
+            for it in t.get("items", []):
+                sales_by_product.setdefault(it["product_id"], 0)
+                sales_by_product[it["product_id"]] += it["qty"]
+        products = await db.products.find({}, {"_id": 0}).to_list(500)
+        # Rank
+        rows = []
+        for p in products:
+            sold = sales_by_product.get(p["id"], 0)
+            rows.append({**p, "sold_30d": sold,
+                         "velocity": sold / max(1, p.get("stock", 1))})
+        rows.sort(key=lambda r: r["sold_30d"])
+        slow = [r for r in rows if r["sold_30d"] < 5 and r.get("stock", 0) > 0][:8]
+        popular = sorted(rows, key=lambda r: r["sold_30d"], reverse=True)[:8]
+
+        if not slow or not popular:
+            return {"suggestions": [], "note": "Belum cukup data penjualan."}
+
+        from emergentintegrations.llm.chat import LlmChat, UserMessage
+        slow_str = "\n".join([f"- {p['name']} (id={p['id']}, stok={p['stock']}, terjual30h={p['sold_30d']})" for p in slow])
+        pop_str = "\n".join([f"- {p['name']} (id={p['id']}, terjual30h={p['sold_30d']})" for p in popular])
+
+        chat = LlmChat(
+            api_key=EMERGENT_LLM_KEY, session_id=f"bundle-{uuid.uuid4()}",
+            system_message=(
+                "Kamu adalah AI merchandising untuk toko UMKM Indonesia. "
+                "Diberikan daftar produk lambat & produk laris, sarankan 3 bundling menarik: "
+                "pasangkan produk lambat dengan produk laris komplementer. "
+                'Balas ONLY JSON dalam format persis: '
+                '{"suggestions":[{"slow_id":"...","slow_name":"...","popular_id":"...",'
+                '"popular_name":"...","promo_name":"...","reason":"...","discount_pct":10}]}. '
+                'Jangan gunakan markdown atau code fence.'
+            )
+        ).with_model("gemini", "gemini-3-flash-preview")
+        prompt = f"PRODUK LAMBAT:\n{slow_str}\n\nPRODUK LARIS:\n{pop_str}"
+        result = await chat.send_message(UserMessage(text=prompt))
+        import re, json
+        text = re.sub(r"^```(json)?", "", str(result).strip()).rstrip("`").strip()
+        m = re.search(r"\{.*\}", text, re.DOTALL)
+        parsed = json.loads(m.group(0)) if m else {"suggestions": []}
+        return parsed
+    except Exception as e:
+        logging.exception("Bundle suggest failed")
+        raise HTTPException(500, f"AI bundling gagal: {str(e)}")
+
+class ApplyBundleIn(BaseModel):
+    slow_id: str
+    popular_id: str
+    promo_name: str
+    discount_pct: int = 10
+
+@api.post("/ai/apply-bundle")
+async def apply_bundle(body: ApplyBundleIn, user: dict = Depends(get_current_user)):
+    """Create a BxGy or percentage promo based on suggestion."""
+    slow = await db.products.find_one({"id": body.slow_id})
+    if not slow:
+        raise HTTPException(404, "Produk lambat tidak ditemukan")
+    pid = str(uuid.uuid4())
+    # Create a percentage promo on the slow product when bought together (simplified: pct on slow when qty>=1)
+    doc = {"id": pid, "name": body.promo_name,
+           "type": "bxgy", "product_id": body.popular_id,
+           "buy_qty": 1, "get_product_id": body.slow_id, "get_qty": 1,
+           "value": body.discount_pct, "min_purchase": 0,
+           "active": True, "ai_generated": True,
+           "created_at": now_utc().isoformat()}
+    await db.promotions.insert_one(doc)
+    return strip_id(doc)
+
+# --- Update seed_data indexes ---
 
 
 # --- AI: Vision OCR for wholesale receipt ---
@@ -1460,6 +1740,9 @@ async def seed_data():
     await db.online_orders.create_index("created_at")
     await db.online_orders.create_index("midtrans_order_id")
     await db.wa_sessions.create_index("phone", unique=True)
+    await db.customers.create_index("phone")
+    await db.debt_ledger.create_index("customer_id")
+    await db.expenses.create_index("date")
 
     # admin
     existing = await db.users.find_one({"email": ADMIN_EMAIL.lower()})

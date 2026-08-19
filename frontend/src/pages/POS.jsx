@@ -7,10 +7,11 @@ import { Badge } from "../components/ui/badge";
 import { Card } from "../components/ui/card";
 import { Sheet, SheetContent, SheetHeader, SheetTitle, SheetTrigger } from "../components/ui/sheet";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "../components/ui/dialog";
-import { Search, Plus, Minus, Trash2, ShoppingCart, Banknote, QrCode, Printer, X, Package, CheckCircle2, Barcode } from "lucide-react";
+import { Search, Plus, Minus, Trash2, ShoppingCart, Banknote, QrCode, Printer, X, Package, CheckCircle2, Barcode, CreditCard } from "lucide-react";
 import { toast } from "sonner";
 import QRISDialog from "../components/QRISDialog";
 import { connectPrinter, printReceipt, printReceiptWeb, isBluetoothSupported } from "../lib/bluetooth";
+import { cacheProducts, readCachedProducts, cacheStore, readCachedStore, queueTransaction, isOnline } from "../lib/offline";
 
 export default function POS() {
   const [products, setProducts] = useState([]);
@@ -27,15 +28,26 @@ export default function POS() {
   const [appliedPromos, setAppliedPromos] = useState([]);
   const [promoDiscount, setPromoDiscount] = useState(0);
   const [manualBarcode, setManualBarcode] = useState("");
+  const [creditForm, setCreditForm] = useState({ name: "", phone: "" });
   const barcodeInputRef = useRef(null);
   const scanBufferRef = useRef({ chars: "", lastAt: 0 });
   const audioCtxRef = useRef(null);
 
   const load = async () => {
-    const [pr, st, sh] = await Promise.all([api.get("/products"), api.get("/settings"), api.get("/shifts/current")]);
-    setProducts(pr.data);
-    setStore(st.data.store);
-    setShiftStatus(sh.data);
+    try {
+      const [pr, st, sh] = await Promise.all([api.get("/products"), api.get("/settings"), api.get("/shifts/current")]);
+      setProducts(pr.data); cacheProducts(pr.data);
+      setStore(st.data.store); cacheStore(st.data.store);
+      setShiftStatus(sh.data);
+    } catch {
+      // Offline fallback
+      const cached = readCachedProducts();
+      if (cached.length) {
+        setProducts(cached);
+        setStore(readCachedStore());
+        toast.warning("Mode offline: pakai data cache lokal", { duration: 3000 });
+      }
+    }
   };
   useEffect(() => { load(); }, []);
 
@@ -171,14 +183,30 @@ export default function POS() {
       applied_promos: appliedPromos,
       ...extra,
     };
-    const r = await api.post("/transactions", payload);
-    setCompletedTx(r.data);
+    try {
+      const r = await api.post("/transactions", payload);
+      setCompletedTx(r.data);
+    } catch (e) {
+      // Offline fallback for cash only (QRIS needs network)
+      if (method === "cash" && !isOnline()) {
+        const size = queueTransaction(payload);
+        setCompletedTx({ ...payload,
+          id: crypto.randomUUID(),
+          order_id: `LOCAL-${Date.now()}`,
+          created_at: new Date().toISOString(),
+          _offline: true });
+        toast.warning(`Tersimpan lokal (antrean: ${size}). Akan sync saat online.`);
+      } else {
+        toast.error("Gagal simpan transaksi");
+        return;
+      }
+    }
     setCart([]);
     setCashAmount("");
     setPayMode(null);
     setCartOpen(false);
+    setCreditForm({ name: "", phone: "" });
     load();
-    toast.success("Transaksi tersimpan!");
   };
 
   const handlePrint = async () => {
@@ -309,13 +337,17 @@ export default function POS() {
       <Dialog open={payMode === "choose" || (cartOpen && cart.length > 0 && payMode === null && false)} onOpenChange={(o)=>!o && setPayMode(null)}>
         <DialogContent>
           <DialogHeader><DialogTitle>Pilih Pembayaran</DialogTitle></DialogHeader>
-          <div className="grid grid-cols-2 gap-3">
+          <div className="grid grid-cols-3 gap-3">
             <Button size="lg" onClick={()=>setPayMode("cash")} className="h-24 flex-col tap" data-testid="pay-cash-btn">
               <Banknote className="h-6 w-6 mb-1" /> Tunai
             </Button>
             <Button size="lg" variant="outline" onClick={()=>{setQrisOrderId(`TRX-${Date.now()}`); setPayMode("qris");}}
                     className="h-24 flex-col tap" data-testid="pay-qris-btn">
               <QrCode className="h-6 w-6 mb-1" /> QRIS
+            </Button>
+            <Button size="lg" variant="outline" onClick={()=>setPayMode("credit")}
+                    className="h-24 flex-col tap" data-testid="pay-credit-btn">
+              <CreditCard className="h-6 w-6 mb-1" /> Bon/Kredit
             </Button>
           </div>
         </DialogContent>
@@ -360,6 +392,34 @@ export default function POS() {
                   amount={total} orderId={qrisOrderId || ""}
                   onPaid={(d) => finishTx("qris", { qris_order_id: qrisOrderId, qris_status: d.status })}
                   onCancel={()=>setPayMode(null)} />
+
+      {/* Credit dialog */}
+      <Dialog open={payMode === "credit"} onOpenChange={(o)=>!o && setPayMode(null)}>
+        <DialogContent>
+          <DialogHeader><DialogTitle className="font-display">Bayar dengan Bon / Kredit</DialogTitle></DialogHeader>
+          <div className="space-y-3">
+            <div className="text-center">
+              <div className="text-xs uppercase tracking-widest text-muted-foreground">Utang</div>
+              <div className="font-display text-3xl font-black text-destructive tracking-tight">{formatIDR(total)}</div>
+            </div>
+            <div>
+              <label className="text-sm">Nama Pelanggan</label>
+              <Input value={creditForm.name} onChange={(e)=>setCreditForm({...creditForm, name:e.target.value})}
+                     placeholder="Bu Sari" data-testid="credit-name" />
+            </div>
+            <div>
+              <label className="text-sm">Nomor WhatsApp (untuk pengingat)</label>
+              <Input value={creditForm.phone} onChange={(e)=>setCreditForm({...creditForm, phone:e.target.value})}
+                     placeholder="628..." data-testid="credit-phone" />
+            </div>
+            <Button className="w-full tap" disabled={!creditForm.name}
+                    onClick={()=>finishTx("credit", { customer_name: creditForm.name, customer_phone: creditForm.phone })}
+                    data-testid="credit-confirm">
+              <CheckCircle2 className="h-4 w-4 mr-2" /> Catat sebagai Utang
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
 
       {/* Completed */}
       <Dialog open={!!completedTx} onOpenChange={(o)=>!o && setCompletedTx(null)}>
