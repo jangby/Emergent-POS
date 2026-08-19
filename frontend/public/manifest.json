@@ -1,16 +1,16 @@
 {
   "short_name": "KasirPintar",
-  "name": "KasirPintar AI - POS & Inventory",
+  "name": "KasirPintar AI - POS & Inventaris UMKM",
+  "description": "Point of Sale mobile-first untuk UMKM Indonesia dengan AI, Midtrans QRIS, Bluetooth thermal printer, dan mode offline.",
   "icons": [
-    {
-      "src": "favicon.ico",
-      "sizes": "64x64 32x32 24x24 16x16",
-      "type": "image/x-icon"
-    }
+    { "src": "favicon.ico", "sizes": "64x64 32x32 24x24 16x16", "type": "image/x-icon" }
   ],
   "start_url": "/",
+  "scope": "/",
   "display": "standalone",
-  "orientation": "portrait",
+  "orientation": "any",
   "theme_color": "#e85d04",
-  "background_color": "#faf7f2"
+  "background_color": "#faf7f2",
+  "categories": ["business", "productivity", "finance"],
+  "lang": "id-ID"
 }

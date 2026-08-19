@@ -11,7 +11,7 @@ import { Search, Plus, Minus, Trash2, ShoppingCart, Banknote, QrCode, Printer, X
 import { toast } from "sonner";
 import QRISDialog from "../components/QRISDialog";
 import { connectPrinter, printReceipt, printReceiptWeb, isBluetoothSupported } from "../lib/bluetooth";
-import { cacheProducts, readCachedProducts, cacheStore, readCachedStore, queueTransaction, isOnline } from "../lib/offline";
+import { cacheProducts, readCachedProducts, cacheStore, readCachedStore, queueTransaction, isOnline as checkOnline } from "../lib/offline";
 
 export default function POS() {
   const [products, setProducts] = useState([]);
@@ -29,6 +29,7 @@ export default function POS() {
   const [promoDiscount, setPromoDiscount] = useState(0);
   const [manualBarcode, setManualBarcode] = useState("");
   const [creditForm, setCreditForm] = useState({ name: "", phone: "" });
+  const [online, setOnline] = useState(typeof navigator !== "undefined" ? navigator.onLine : true);
   const barcodeInputRef = useRef(null);
   const scanBufferRef = useRef({ chars: "", lastAt: 0 });
   const audioCtxRef = useRef(null);
@@ -41,15 +42,27 @@ export default function POS() {
       setShiftStatus(sh.data);
     } catch {
       // Offline fallback
-      const cached = readCachedProducts();
+      const cached = await readCachedProducts();
       if (cached.length) {
         setProducts(cached);
-        setStore(readCachedStore());
-        toast.warning("Mode offline: pakai data cache lokal", { duration: 3000 });
+        setStore(await readCachedStore());
+        toast.warning("Mode Offline aktif - pakai data cache lokal", { duration: 3000 });
       }
     }
   };
   useEffect(() => { load(); }, []);
+
+  // Track online/offline
+  useEffect(() => {
+    const on = () => setOnline(true);
+    const off = () => setOnline(false);
+    window.addEventListener("online", on);
+    window.addEventListener("offline", off);
+    return () => {
+      window.removeEventListener("online", on);
+      window.removeEventListener("offline", off);
+    };
+  }, []);
 
   // Physical barcode scanner: capture rapid keypress sequences ending with Enter
   const beep = () => {
@@ -186,16 +199,17 @@ export default function POS() {
     try {
       const r = await api.post("/transactions", payload);
       setCompletedTx(r.data);
+      toast.success("Transaksi tersimpan!");
     } catch (e) {
-      // Offline fallback for cash only (QRIS needs network)
-      if (method === "cash" && !isOnline()) {
-        const size = queueTransaction(payload);
+      // Offline fallback for cash only (QRIS/credit need network)
+      if (method === "cash" && !navigator.onLine) {
+        const entry = await queueTransaction(payload);
         setCompletedTx({ ...payload,
-          id: crypto.randomUUID(),
+          id: entry._local_id,
           order_id: `LOCAL-${Date.now()}`,
           created_at: new Date().toISOString(),
           _offline: true });
-        toast.warning(`Tersimpan lokal (antrean: ${size}). Akan sync saat online.`);
+        toast.warning("Disimpan lokal. Akan sync otomatis saat online.", { duration: 3500 });
       } else {
         toast.error("Gagal simpan transaksi");
         return;
@@ -342,12 +356,14 @@ export default function POS() {
               <Banknote className="h-6 w-6 mb-1" /> Tunai
             </Button>
             <Button size="lg" variant="outline" onClick={()=>{setQrisOrderId(`TRX-${Date.now()}`); setPayMode("qris");}}
-                    className="h-24 flex-col tap" data-testid="pay-qris-btn">
+                    disabled={!online} className="h-24 flex-col tap relative" data-testid="pay-qris-btn">
               <QrCode className="h-6 w-6 mb-1" /> QRIS
+              {!online && <span className="absolute -top-2 -right-2 text-[9px] bg-red-600 text-white rounded-full px-1.5 py-0.5">Butuh Internet</span>}
             </Button>
             <Button size="lg" variant="outline" onClick={()=>setPayMode("credit")}
-                    className="h-24 flex-col tap" data-testid="pay-credit-btn">
+                    disabled={!online} className="h-24 flex-col tap relative" data-testid="pay-credit-btn">
               <CreditCard className="h-6 w-6 mb-1" /> Bon/Kredit
+              {!online && <span className="absolute -top-2 -right-2 text-[9px] bg-red-600 text-white rounded-full px-1.5 py-0.5">Butuh Internet</span>}
             </Button>
           </div>
         </DialogContent>
