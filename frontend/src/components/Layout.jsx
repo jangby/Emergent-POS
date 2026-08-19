@@ -7,6 +7,7 @@ import {
 } from "lucide-react";
 import { useAuth } from "../context/AuthContext";
 import { useTheme } from "../context/ThemeContext";
+import { useBranding } from "../context/BrandingContext";
 import { Button } from "./ui/button";
 import { Sheet, SheetContent, SheetHeader, SheetTitle, SheetTrigger } from "./ui/sheet";
 import { InstallButton } from "./InstallPWA";
@@ -34,8 +35,18 @@ const ALL_NAV = [...PRIMARY_NAV, ...SECONDARY_NAV];
 export default function Layout({ children }) {
   const { user, logout } = useAuth();
   const { theme, toggle } = useTheme();
+  const { branding } = useBranding();
   const nav = useNavigate();
   const [moreOpen, setMoreOpen] = useState(false);
+
+  const LogoIcon = () => (
+    branding?.logo_base64 ? (
+      <img src={branding.logo_base64} alt={branding.short_name}
+           className="h-full w-full object-cover" />
+    ) : (
+      <Sparkles className="h-full w-full p-[22%] text-primary-foreground" strokeWidth={2} />
+    )
+  );
 
   const NavItem = ({ n, mobile }) => (
     <NavLink to={n.to} end={n.to === "/"} data-testid={mobile ? `${n.testid}-mobile` : n.testid}
@@ -56,12 +67,12 @@ export default function Layout({ children }) {
     <div className="min-h-screen bg-background text-foreground flex overflow-x-hidden">
       <aside className="hidden md:flex w-64 border-r border-border/60 bg-card/60 flex-col p-5 sticky top-0 h-screen">
         <div className="flex items-center gap-2 mb-8">
-          <div className="h-10 w-10 rounded-lg bg-primary flex items-center justify-center">
-            <Sparkles className="h-5 w-5 text-primary-foreground" />
+          <div className="h-10 w-10 rounded-lg bg-primary flex items-center justify-center overflow-hidden">
+            <LogoIcon />
           </div>
           <div>
-            <div className="font-display font-black text-lg leading-none tracking-tight">KasirPintar</div>
-            <div className="text-xs text-muted-foreground uppercase tracking-widest">AI · POS</div>
+            <div className="font-display font-black text-lg leading-none tracking-tight truncate max-w-[10rem]" data-testid="brand-name-desktop">{branding?.short_name || "KasirPintar"}</div>
+            <div className="text-xs text-muted-foreground uppercase tracking-widest">POS · AI</div>
           </div>
         </div>
         <nav className="flex-1 space-y-1 overflow-y-auto">
@@ -86,10 +97,10 @@ export default function Layout({ children }) {
       <main className="flex-1 pb-24 md:pb-0 min-w-0">
         <div className="md:hidden sticky top-0 z-40 backdrop-blur-xl bg-background/85 border-b border-border/60 flex items-center justify-between px-4 py-3">
           <div className="flex items-center gap-2">
-            <div className="h-8 w-8 rounded-md bg-primary flex items-center justify-center">
-              <Sparkles className="h-4 w-4 text-primary-foreground" />
+            <div className="h-8 w-8 rounded-md bg-primary flex items-center justify-center overflow-hidden">
+              <LogoIcon />
             </div>
-            <span className="font-display font-black tracking-tight">KasirPintar</span>
+            <span className="font-display font-black tracking-tight truncate max-w-[10rem]" data-testid="brand-name-mobile">{branding?.short_name || "KasirPintar"}</span>
           </div>
           <div className="flex gap-2">
             <Button variant="ghost" size="icon" onClick={toggle} data-testid="theme-toggle-mobile">

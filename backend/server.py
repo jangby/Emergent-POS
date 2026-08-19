@@ -1178,6 +1178,7 @@ async def get_settings(user: dict = Depends(get_current_user)):
     mt = doc.get("midtrans", {})
     fn = doc.get("fonnte", {})
     gm = doc.get("gemini", {})
+    br = doc.get("branding", {})
     return {
         "store": store,
         "midtrans": {
@@ -1193,6 +1194,13 @@ async def get_settings(user: dict = Depends(get_current_user)):
         "gemini": {
             "configured": bool(gm.get("api_key_enc")),
             "model": GEMINI_MODEL_TEXT,
+        },
+        "branding": {
+            "app_name": br.get("app_name") or "KasirPintar AI",
+            "short_name": br.get("short_name") or "KasirPintar",
+            "theme_color": br.get("theme_color") or "#e85d04",
+            "logo_base64": br.get("logo_base64") or "",
+            "updated_at": br.get("updated_at"),
         },
     }
 
@@ -1258,6 +1266,75 @@ async def test_gemini(user: dict = Depends(get_current_user)):
         raise
     except Exception as e:
         raise HTTPException(502, f"Test gagal: {str(e)}")
+
+
+# --- Per-tenant Branding (white-label + dynamic PWA manifest) ---
+import re as _re_branding
+
+_HEX_RE = _re_branding.compile(r"^#[0-9a-fA-F]{6}$")
+
+class BrandingIn(BaseModel):
+    app_name: str = Field(min_length=1, max_length=30)
+    short_name: str = Field(min_length=1, max_length=12)
+    theme_color: str = "#e85d04"
+    logo_base64: str = ""  # data URL 'data:image/...;base64,...' or empty
+
+@api.get("/settings/branding")
+async def get_branding(user: dict = Depends(get_current_user)):
+    doc = await db.settings.find_one({"tenant_id": tenant_of(user)}) or {}
+    b = doc.get("branding") or {}
+    return {
+        "app_name": b.get("app_name") or "KasirPintar AI",
+        "short_name": b.get("short_name") or "KasirPintar",
+        "theme_color": b.get("theme_color") or "#e85d04",
+        "logo_base64": b.get("logo_base64") or "",
+        "updated_at": b.get("updated_at"),
+    }
+
+@api.put("/settings/branding")
+async def save_branding(body: BrandingIn, user: dict = Depends(get_current_user)):
+    color = body.theme_color.strip()
+    if not _HEX_RE.match(color):
+        raise HTTPException(400, "Warna tema harus format hex #RRGGBB (misal #e85d04)")
+    logo = (body.logo_base64 or "").strip()
+    # Optional server-side re-crop/resize to 512x512 (best-effort)
+    if logo.startswith("data:image"):
+        try:
+            from PIL import Image
+            import io
+            header, b64part = logo.split(",", 1)
+            img_bytes = base64.b64decode(b64part)
+            img = Image.open(io.BytesIO(img_bytes)).convert("RGBA")
+            w, h = img.size
+            side = min(w, h)
+            left = (w - side) // 2
+            top = (h - side) // 2
+            img = img.crop((left, top, left + side, top + side)).resize((512, 512), Image.LANCZOS)
+            buf = io.BytesIO()
+            img.save(buf, format="PNG", optimize=True)
+            logo = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+        except Exception:
+            logging.exception("Logo resize failed; storing client-provided image as-is")
+    if logo and len(logo) > 800_000:
+        raise HTTPException(400, "Logo terlalu besar. Maksimum 600KB setelah encoding.")
+    payload = {
+        "app_name": body.app_name.strip(),
+        "short_name": body.short_name.strip(),
+        "theme_color": color,
+        "logo_base64": logo,
+        "updated_at": now_utc().isoformat(),
+    }
+    await db.settings.update_one(
+        {"tenant_id": tenant_of(user)},
+        {"$set": {"tenant_id": tenant_of(user), "branding": payload}},
+        upsert=True,
+    )
+    return {"ok": True, **payload}
+
+@api.delete("/settings/branding")
+async def reset_branding(user: dict = Depends(get_current_user)):
+    await db.settings.update_one({"tenant_id": tenant_of(user)}, {"$unset": {"branding": ""}})
+    return {"ok": True}
 
 def midtrans_base(mode: str) -> str:
     return "https://api.sandbox.midtrans.com" if mode == "sandbox" else "https://api.midtrans.com"
