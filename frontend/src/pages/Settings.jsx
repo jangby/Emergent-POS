@@ -14,7 +14,7 @@ export default function Settings() {
   const [store, setStore] = useState({ name: "", address: "", phone: "", footer: "" });
   const [mt, setMt] = useState({ mode: "sandbox", merchant_id: "", client_key: "", server_key: "", configured: false });
   const [fn, setFn] = useState({ token: "", configured: false });
-  const [gm, setGm] = useState({ api_key: "", configured: false, model: "gemini-2.5-flash" });
+  const [gm, setGm] = useState({ api_key: "", configured: false, model: "gemini-3.6-flash" });
   const [gmTesting, setGmTesting] = useState(false);
   const [printer, setPrinter] = useState(getConnectedPrinter());
 
@@ -23,7 +23,7 @@ export default function Settings() {
     setStore(r.data.store);
     setMt({ ...r.data.midtrans, server_key: "" });
     setFn({ token: "", configured: !!r.data.fonnte?.configured });
-    setGm({ api_key: "", configured: !!r.data.gemini?.configured, model: r.data.gemini?.model || "gemini-2.5-flash" });
+    setGm({ api_key: "", configured: !!r.data.gemini?.configured, model: r.data.gemini?.model || "gemini-3.6-flash" });
   };
   useEffect(() => { refresh(); }, []);
 

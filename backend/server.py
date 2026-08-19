@@ -98,8 +98,8 @@ def tenant_of(user: dict) -> str:
 
 
 # --- Gemini (BYOK per-tenant) helpers ---
-GEMINI_MODEL_TEXT = "gemini-2.5-flash"
-GEMINI_MODEL_VISION = "gemini-2.5-flash"
+GEMINI_MODEL_TEXT = "gemini-3.6-flash"
+GEMINI_MODEL_VISION = "gemini-3.6-flash"
 GEMINI_TIMEOUT_SEC = 45  # keep under Cloudflare / ingress 60-100s cutoff
 
 # genai.configure() sets a *process-global* API key. Serialize configure+call so
