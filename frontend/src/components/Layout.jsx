@@ -9,6 +9,7 @@ import { useAuth } from "../context/AuthContext";
 import { useTheme } from "../context/ThemeContext";
 import { Button } from "./ui/button";
 import { Sheet, SheetContent, SheetHeader, SheetTitle, SheetTrigger } from "./ui/sheet";
+import { InstallButton } from "./InstallPWA";
 
 const PRIMARY_NAV = [
   { to: "/", label: "Kasir", icon: ShoppingCart, testid: "nav-pos" },
@@ -69,6 +70,7 @@ export default function Layout({ children }) {
         <div className="border-t border-border/60 pt-4 mt-4 space-y-2">
           <div className="text-xs text-muted-foreground truncate">{user?.email}</div>
           <div className="text-[10px] uppercase tracking-widest text-muted-foreground">{user?.role}</div>
+          <InstallButton variant="outline" size="sm" className="w-full" />
           <div className="flex gap-2">
             <Button variant="outline" size="icon" onClick={toggle} data-testid="theme-toggle">
               {theme === "dark" ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}

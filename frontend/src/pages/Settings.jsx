@@ -5,9 +5,10 @@ import { Input } from "../components/ui/input";
 import { Label } from "../components/ui/label";
 import { Button } from "../components/ui/button";
 import { Select, SelectTrigger, SelectContent, SelectItem, SelectValue } from "../components/ui/select";
-import { Printer, Bluetooth, Store, KeyRound, CheckCircle2, MessageCircle } from "lucide-react";
+import { Printer, Bluetooth, Store, KeyRound, CheckCircle2, MessageCircle, Download } from "lucide-react";
 import { toast } from "sonner";
 import { connectPrinter, printTest, isBluetoothSupported, getConnectedPrinter } from "../lib/bluetooth";
+import { InstallButton, InstalledBadge } from "../components/InstallPWA";
 
 export default function Settings() {
   const [store, setStore] = useState({ name: "", address: "", phone: "", footer: "" });
@@ -54,6 +55,20 @@ export default function Settings() {
         <h1 className="font-display text-3xl md:text-4xl font-black tracking-tighter">Pengaturan</h1>
         <p className="text-sm text-muted-foreground">Profil toko, Midtrans, dan printer Bluetooth.</p>
       </div>
+
+      <Card className="p-5 border-border/70 space-y-3">
+        <div className="flex items-center gap-2">
+          <Download className="h-5 w-5 text-primary" />
+          <span className="font-display font-black tracking-tight">Aplikasi PWA</span>
+        </div>
+        <p className="text-xs text-muted-foreground">
+          Instal KasirPintar sebagai aplikasi native di HP / desktop Anda untuk akses cepat & mode offline penuh.
+        </p>
+        <div className="flex items-center gap-3 flex-wrap">
+          <InstalledBadge />
+          <InstallButton variant="default" size="default" />
+        </div>
+      </Card>
 
       <Card className="p-5 border-border/70 space-y-3">
         <div className="flex items-center gap-2"><Store className="h-5 w-5 text-primary" /><span className="font-display font-black tracking-tight">Profil Toko</span></div>

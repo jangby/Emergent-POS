@@ -20,6 +20,7 @@ import Customers from "./pages/Customers";
 import Expenses from "./pages/Expenses";
 import Bundles from "./pages/Bundles";
 import OfflineIndicator from "./components/OfflineIndicator";
+import InstallBanner from "./components/InstallPWA";
 import { Toaster } from "./components/ui/sonner";
 
 export default function App() {
@@ -45,6 +46,7 @@ export default function App() {
             <Route path="/settings" element={<ProtectedRoute><Layout><Settings /></Layout></ProtectedRoute>} />
           </Routes>
           <OfflineIndicator />
+          <InstallBanner />
           <Toaster position="top-right" richColors />
         </BrowserRouter>
       </AuthProvider>

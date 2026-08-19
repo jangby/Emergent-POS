@@ -1,16 +1,27 @@
 {
+  "name": "KasirPintar AI - Smart POS & Kasir UMKM",
   "short_name": "KasirPintar",
-  "name": "KasirPintar AI - POS & Inventaris UMKM",
-  "description": "Point of Sale mobile-first untuk UMKM Indonesia dengan AI, Midtrans QRIS, Bluetooth thermal printer, dan mode offline.",
-  "icons": [
-    { "src": "favicon.ico", "sizes": "64x64 32x32 24x24 16x16", "type": "image/x-icon" }
-  ],
+  "description": "Kasir pintar dengan AI, QRIS Midtrans, Bluetooth thermal, dan mode offline untuk UMKM Indonesia.",
   "start_url": "/",
   "scope": "/",
   "display": "standalone",
   "orientation": "any",
-  "theme_color": "#e85d04",
-  "background_color": "#faf7f2",
+  "background_color": "#ffffff",
+  "theme_color": "#4f46e5",
+  "lang": "id-ID",
   "categories": ["business", "productivity", "finance"],
-  "lang": "id-ID"
+  "icons": [
+    {
+      "src": "data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 192 192'><rect width='192' height='192' rx='36' fill='%23E85D04'/><path d='M56 44h20v46l38-46h24l-40 46 42 58h-24l-32-44-8 10v34H56z' fill='white'/><circle cx='140' cy='58' r='10' fill='%23FCD34D'/></svg>",
+      "sizes": "192x192",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 512 512'><rect width='512' height='512' rx='96' fill='%23E85D04'/><path d='M150 118h54v122l100-122h64l-108 124 112 154h-64l-86-118-18 24v92h-54z' fill='white'/><circle cx='372' cy='156' r='26' fill='%23FCD34D'/></svg>",
+      "sizes": "512x512",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
 }
