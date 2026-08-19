@@ -5,6 +5,7 @@ Mobile-first Web POS + Inventory app for Indonesian UMKM.
 ## Core features (Delivered)
 - JWT auth (login/register); admin seeded as robaya05@gmail.com
 - **Multi-Tenant architecture (2026-02)**: every registered user is owner of their own isolated tenant; cashiers inherit tenant from owner. All CRUD/analytics/settings filtered by `tenant_id`. Frontend clears IndexedDB + localStorage on login/logout to prevent leakage.
+- **BYOK Gemini AI (2026-02)**: each tenant stores their own Google Gemini API key (encrypted). All AI features (Restock OCR, business insights, WA order parser, bundle suggestions, WA bot) call the **official `google-generativeai` SDK** with the tenant's key. Model: `gemini-2.5-flash`. Endpoints: `GET/PUT/DELETE /api/settings/gemini` + `POST /api/settings/gemini/test`. Clear 400 error when key missing or invalid.
 - POS: product grid, category filter, cart, cash + QRIS + credit payment, receipt
 - Web Bluetooth ESC/POS thermal printer + PDF fallback
 - Physical hardware barcode scanner (global keydown listener)
@@ -16,21 +17,20 @@ Mobile-first Web POS + Inventory app for Indonesian UMKM.
 - Promotions engine (percentage / fixed / BxGy / min-purchase)
 - Debt / customer credit ledger + WA reminders
 - Expense tracker + Net Profit computation
-- AI Vision OCR receipt scanner (Gemini 3 Flash)
-- AI Business Insights & AI Bundle Suggestions (Gemini 3 Flash)
-- AI WhatsApp order parser + fully automated WA bot (per-tenant webhook)
+- AI Vision OCR receipt scanner (per-tenant Gemini key)
+- AI Business Insights & AI Bundle Suggestions (per-tenant Gemini key)
+- AI WhatsApp order parser + fully automated WA bot (per-tenant webhook + per-tenant Gemini key)
 - Midtrans QRIS integration (per-tenant credentials, webhook resolves tenant via order_id)
 - Fonnte WhatsApp (per-tenant token)
 - Offline-first PWA (IndexedDB queue, service worker, background sync, install prompt)
 - Dark/light theme toggle
 - Sample Indonesian retail products pre-seeded (admin tenant only)
 
-## Multi-Tenancy Model (2026-02)
-- `tenant_id` = owner's `user.id`. Registration → `tenant_id = new user's id`. Cashier creation → inherits `current_user.tenant_id`.
-- Backend: `get_current_user` returns `{..., tenant_id}`; every DB query/insert scoped via `tenant_of(user)` helper.
-- Migration: on startup, any legacy doc lacking `tenant_id` is backfilled to the admin tenant.
-- Webhooks: `/api/whatsapp/webhook/{tenant_id}` (per-tenant); Midtrans webhook resolves tenant from `qris_payments.tenant_id` lookup by `order_id`. Legacy `/api/whatsapp/webhook` still exists and routes to admin tenant for backward compat.
-- Frontend: `clearAllLocalData()` invoked on login/register/logout; UID mismatch on session bootstrap also wipes cache.
+## Multi-Tenancy & BYOK notes
+- `tenant_id` = owner's `user.id`. Cashiers inherit from owner.
+- `tenant_of(user)` helper is applied to every DB query/insert.
+- Gemini API key stored under `settings.gemini.api_key_enc` (Fernet-encrypted). Never returned to frontend — only `configured: true/false` is exposed.
+- Legacy pre-multi-tenant docs backfilled to admin tenant on startup.
 
 ## Backlog (P1)
 - Dynamic White-Labeling & Custom PWA Branding (per-tenant App name, short_name, logo, theme color, live preview, dynamic manifest blob)
@@ -39,6 +39,8 @@ Mobile-first Web POS + Inventory app for Indonesian UMKM.
 
 ## Backlog (P2)
 - Monthly top-cashier auto-award + printable certificate
+- Cashier role restriction (limit access to POS-only, hide analytics/settings)
 
 ## Refactor / Tech debt
-- `/app/backend/server.py` ~1900 lines — split into routers (auth, products, tx, analytics, settings, wa, midtrans, exports)
+- `/app/backend/server.py` ~2020 lines — split into routers (auth, products, tx, analytics, settings, wa, midtrans, ai, exports)
+- `EMERGENT_LLM_KEY` env var + import are now unused since BYOK migration → safe to remove in a cleanup pass

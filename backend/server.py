@@ -95,6 +95,51 @@ def tenant_of(user: dict) -> str:
     """Return the tenant id for the given authenticated user."""
     return user.get("tenant_id") or user["id"]
 
+
+# --- Gemini (BYOK per-tenant) helpers ---
+GEMINI_MODEL_TEXT = "gemini-2.5-flash"
+GEMINI_MODEL_VISION = "gemini-2.5-flash"
+
+async def get_gemini_key(tenant_id: str) -> str:
+    doc = await db.settings.find_one({"tenant_id": tenant_id}) or {}
+    enc_key = doc.get("gemini", {}).get("api_key_enc")
+    if not enc_key:
+        raise HTTPException(
+            400,
+            "Gemini API Key belum dikonfigurasi. Silakan atur di menu Pengaturan → Konfigurasi AI."
+        )
+    return dec(enc_key)
+
+async def gemini_generate(tenant_id: str, system: str, user_prompt: str,
+                          image_b64: Optional[str] = None,
+                          image_mime: str = "image/jpeg",
+                          model_name: Optional[str] = None) -> str:
+    """Call Gemini via the official google-generativeai SDK using the tenant's own API key."""
+    key = await get_gemini_key(tenant_id)
+    mname = model_name or (GEMINI_MODEL_VISION if image_b64 else GEMINI_MODEL_TEXT)
+
+    def _run():
+        import google.generativeai as genai
+        genai.configure(api_key=key)
+        model = genai.GenerativeModel(model_name=mname, system_instruction=system)
+        parts: list = [user_prompt]
+        if image_b64:
+            parts.append({"mime_type": image_mime, "data": base64.b64decode(image_b64)})
+        resp = model.generate_content(parts,
+                                      generation_config={"response_mime_type": "text/plain"})
+        return resp.text or ""
+
+    try:
+        return await asyncio.to_thread(_run)
+    except HTTPException:
+        raise
+    except Exception as e:
+        msg = str(e)
+        low = msg.lower()
+        if "api key" in low or "api_key" in low or "invalid" in low or "permission" in low:
+            raise HTTPException(400, f"Gemini API Key tidak valid atau ditolak: {msg}")
+        raise HTTPException(502, f"Panggilan Gemini gagal: {msg}")
+
 def enc(v: str) -> str:
     return fernet.encrypt(v.encode()).decode() if fernet and v else v
 
@@ -726,29 +771,27 @@ async def suggest_bundles(user: dict = Depends(get_current_user)):
         if not slow or not popular:
             return {"suggestions": [], "note": "Belum cukup data penjualan."}
 
-        from emergentintegrations.llm.chat import LlmChat, UserMessage
         slow_str = "\n".join([f"- {p['name']} (id={p['id']}, stok={p['stock']}, terjual30h={p['sold_30d']})" for p in slow])
         pop_str = "\n".join([f"- {p['name']} (id={p['id']}, terjual30h={p['sold_30d']})" for p in popular])
 
-        chat = LlmChat(
-            api_key=EMERGENT_LLM_KEY, session_id=f"bundle-{uuid.uuid4()}",
-            system_message=(
-                "Kamu adalah AI merchandising untuk toko UMKM Indonesia. "
-                "Diberikan daftar produk lambat & produk laris, sarankan 3 bundling menarik: "
-                "pasangkan produk lambat dengan produk laris komplementer. "
-                'Balas ONLY JSON dalam format persis: '
-                '{"suggestions":[{"slow_id":"...","slow_name":"...","popular_id":"...",'
-                '"popular_name":"...","promo_name":"...","reason":"...","discount_pct":10}]}. '
-                'Jangan gunakan markdown atau code fence.'
-            )
-        ).with_model("gemini", "gemini-3-flash-preview")
+        system = (
+            "Kamu adalah AI merchandising untuk toko UMKM Indonesia. "
+            "Diberikan daftar produk lambat & produk laris, sarankan 3 bundling menarik: "
+            "pasangkan produk lambat dengan produk laris komplementer. "
+            'Balas ONLY JSON dalam format persis: '
+            '{"suggestions":[{"slow_id":"...","slow_name":"...","popular_id":"...",'
+            '"popular_name":"...","promo_name":"...","reason":"...","discount_pct":10}]}. '
+            'Jangan gunakan markdown atau code fence.'
+        )
         prompt = f"PRODUK LAMBAT:\n{slow_str}\n\nPRODUK LARIS:\n{pop_str}"
-        result = await chat.send_message(UserMessage(text=prompt))
+        result = await gemini_generate(tenant_of(user), system, prompt)
         import re, json
         text = re.sub(r"^```(json)?", "", str(result).strip()).rstrip("`").strip()
         m = re.search(r"\{.*\}", text, re.DOTALL)
         parsed = json.loads(m.group(0)) if m else {"suggestions": []}
         return parsed
+    except HTTPException:
+        raise
     except Exception as e:
         logging.exception("Bundle suggest failed")
         raise HTTPException(500, f"AI bundling gagal: {str(e)}")
@@ -783,30 +826,25 @@ async def apply_bundle(body: ApplyBundleIn, user: dict = Depends(get_current_use
 @api.post("/ai/scan-receipt")
 async def scan_receipt(file: UploadFile = File(...), user: dict = Depends(get_current_user)):
     try:
-        from emergentintegrations.llm.chat import LlmChat, UserMessage, ImageContent
         content = await file.read()
         b64 = base64.b64encode(content).decode()
-        chat = LlmChat(
-            api_key=EMERGENT_LLM_KEY,
-            session_id=f"ocr-{uuid.uuid4()}",
-            system_message=(
-                "You are an OCR AI for Indonesian wholesale receipts (Nota Belanja Grosir). "
-                "Extract each product line item and return ONLY valid JSON: "
-                '{"items":[{"name":"...","qty":<int>,"buy_price":<int rupiah per unit, no decimals>}]}. '
-                "Do not include markdown or explanation."
-            )
-        ).with_model("gemini", "gemini-3-flash-preview")
-
-        msg = UserMessage(text="Extract items from this receipt image.",
-                          file_contents=[ImageContent(image_base64=b64)])
-        result = await chat.send_message(msg)
-        text = result if isinstance(result, str) else str(result)
-        # Strip code fences if present
+        mime = file.content_type or "image/jpeg"
+        system = (
+            "You are an OCR AI for Indonesian wholesale receipts (Nota Belanja Grosir). "
+            "Extract each product line item and return ONLY valid JSON: "
+            '{"items":[{"name":"...","qty":<int>,"buy_price":<int rupiah per unit, no decimals>}]}. '
+            "Do not include markdown or explanation."
+        )
+        result = await gemini_generate(tenant_of(user), system,
+                                       "Extract items from this receipt image.",
+                                       image_b64=b64, image_mime=mime)
         import re, json
-        text = re.sub(r"^```(json)?", "", text.strip()).rstrip("`").strip()
+        text = re.sub(r"^```(json)?", "", str(result).strip()).rstrip("`").strip()
         m = re.search(r"\{.*\}", text, re.DOTALL)
         parsed = json.loads(m.group(0)) if m else {"items": []}
         return parsed
+    except HTTPException:
+        raise
     except Exception as e:
         logging.exception("OCR failed")
         raise HTTPException(500, f"AI OCR gagal: {str(e)}")
@@ -972,29 +1010,22 @@ class OrderParseIn(BaseModel):
 @api.post("/ai/parse-order")
 async def parse_order(body: OrderParseIn, user: dict = Depends(get_current_user)):
     try:
-        from emergentintegrations.llm.chat import LlmChat, UserMessage
         products = await db.products.find({"tenant_id": tenant_of(user)}, {"_id": 0}).to_list(500)
         catalog = "\n".join([f"- {p['name']} (id={p['id']}, harga={p['sell_price']}, stok={p['stock']})" for p in products])
 
-        chat = LlmChat(
-            api_key=EMERGENT_LLM_KEY,
-            session_id=f"order-{uuid.uuid4()}",
-            system_message=(
-                "Kamu adalah AI yang memahami pesan pemesanan WhatsApp dari pelanggan toko UMKM Indonesia. "
-                "Diberikan katalog produk dan pesan bebas dari pelanggan, cocokkan item yang dipesan "
-                "berdasarkan nama yang mirip (misal 'indomie' cocok dengan 'Indomie Goreng'). "
-                "Balas ONLY JSON valid dalam format: "
-                '{"items":[{"product_id":"...","name":"...","qty":<int>}], "unmatched":["..."]}. '
-                "unmatched berisi item yang tidak ditemukan di katalog. "
-                "Jangan gunakan markdown."
-            )
-        ).with_model("gemini", "gemini-3-flash-preview")
-
+        system = (
+            "Kamu adalah AI yang memahami pesan pemesanan WhatsApp dari pelanggan toko UMKM Indonesia. "
+            "Diberikan katalog produk dan pesan bebas dari pelanggan, cocokkan item yang dipesan "
+            "berdasarkan nama yang mirip (misal 'indomie' cocok dengan 'Indomie Goreng'). "
+            "Balas ONLY JSON valid dalam format: "
+            '{"items":[{"product_id":"...","name":"...","qty":<int>}], "unmatched":["..."]}. '
+            "unmatched berisi item yang tidak ditemukan di katalog. "
+            "Jangan gunakan markdown."
+        )
         prompt = f"KATALOG:\n{catalog}\n\nPESAN PELANGGAN:\n{body.text}"
-        result = await chat.send_message(UserMessage(text=prompt))
-        text = result if isinstance(result, str) else str(result)
+        result = await gemini_generate(tenant_of(user), system, prompt)
         import re, json
-        text = re.sub(r"^```(json)?", "", text.strip()).rstrip("`").strip()
+        text = re.sub(r"^```(json)?", "", str(result).strip()).rstrip("`").strip()
         m = re.search(r"\{.*\}", text, re.DOTALL)
         parsed = json.loads(m.group(0)) if m else {"items": [], "unmatched": []}
 
@@ -1011,6 +1042,8 @@ async def parse_order(body: OrderParseIn, user: dict = Depends(get_current_user)
                     "stock": pr["stock"],
                 })
         return {"items": enriched, "unmatched": parsed.get("unmatched", [])}
+    except HTTPException:
+        raise
     except Exception as e:
         logging.exception("Order parse failed")
         raise HTTPException(500, f"AI gagal memahami pesan: {str(e)}")
@@ -1020,23 +1053,17 @@ async def parse_order(body: OrderParseIn, user: dict = Depends(get_current_user)
 @api.get("/ai/insights")
 async def ai_insights(user: dict = Depends(get_current_user)):
     try:
-        from emergentintegrations.llm.chat import LlmChat, UserMessage
         summary = await analytics_summary(user)
         products = await db.products.find({"tenant_id": tenant_of(user)}, {"_id": 0}).to_list(500)
         low_stock = [p["name"] for p in products if p["stock"] <= 5]
         top_names = ", ".join([f"{p['name']} ({p['qty']} terjual)" for p in summary["top_products"][:3]]) or "belum ada data"
 
-        chat = LlmChat(
-            api_key=EMERGENT_LLM_KEY,
-            session_id=f"insight-{uuid.uuid4()}",
-            system_message=(
-                "Kamu adalah asisten AI bisnis untuk pemilik toko UMKM Indonesia. "
-                "Berikan 3-4 kalimat singkat, ramah, dalam Bahasa Indonesia. "
-                "Fokus pada: produk terlaris, peringatan stok menipis, dan saran singkat. "
-                "Jangan pakai markdown atau bullet. Tulis sebagai paragraf natural."
-            )
-        ).with_model("gemini", "gemini-3-flash-preview")
-
+        system = (
+            "Kamu adalah asisten AI bisnis untuk pemilik toko UMKM Indonesia. "
+            "Berikan 3-4 kalimat singkat, ramah, dalam Bahasa Indonesia. "
+            "Fokus pada: produk terlaris, peringatan stok menipis, dan saran singkat. "
+            "Jangan pakai markdown atau bullet. Tulis sebagai paragraf natural."
+        )
         prompt = (
             f"Pendapatan hari ini: Rp{summary['today_revenue']:,}. "
             f"Pendapatan 30 hari: Rp{summary['month_revenue']:,}. "
@@ -1045,9 +1072,13 @@ async def ai_insights(user: dict = Depends(get_current_user)):
             f"Produk terlaris: {top_names}. "
             f"Stok menipis: {', '.join(low_stock[:5]) or 'tidak ada'}."
         )
-        result = await chat.send_message(UserMessage(text=prompt))
-        text = result if isinstance(result, str) else str(result)
-        return {"insight": text.strip()}
+        result = await gemini_generate(tenant_of(user), system, prompt)
+        return {"insight": str(result).strip()}
+    except HTTPException as he:
+        # Surface the 400 to frontend so it can prompt to configure the key
+        if he.status_code == 400:
+            raise
+        return {"insight": f"Ringkasan AI tidak tersedia saat ini. ({he.detail})"}
     except Exception as e:
         logging.exception("Insight failed")
         return {"insight": f"Ringkasan AI tidak tersedia saat ini. ({str(e)})"}
@@ -1071,6 +1102,7 @@ async def get_settings(user: dict = Depends(get_current_user)):
     store = doc.get("store", StoreProfile().model_dump())
     mt = doc.get("midtrans", {})
     fn = doc.get("fonnte", {})
+    gm = doc.get("gemini", {})
     return {
         "store": store,
         "midtrans": {
@@ -1082,6 +1114,10 @@ async def get_settings(user: dict = Depends(get_current_user)):
         },
         "fonnte": {
             "configured": bool(fn.get("token_enc")),
+        },
+        "gemini": {
+            "configured": bool(gm.get("api_key_enc")),
+            "model": GEMINI_MODEL_TEXT,
         },
     }
 
@@ -1114,6 +1150,39 @@ async def get_midtrans_creds(tenant_id: str):
             "server_key": dec(mt["server_key_enc"]),
             "client_key": dec(mt.get("client_key_enc", "")),
             "merchant_id": dec(mt.get("merchant_id_enc", ""))}
+
+
+# --- Gemini AI settings (BYOK per-tenant) ---
+class GeminiSettingsIn(BaseModel):
+    api_key: str = Field(min_length=8)
+
+@api.put("/settings/gemini")
+async def save_gemini(body: GeminiSettingsIn, user: dict = Depends(get_current_user)):
+    await db.settings.update_one({"tenant_id": tenant_of(user)},
+                                 {"$set": {"tenant_id": tenant_of(user), "gemini": {
+                                     "api_key_enc": enc(body.api_key.strip()),
+                                     "updated_at": now_utc().isoformat(),
+                                 }}}, upsert=True)
+    return {"ok": True, "configured": True}
+
+@api.delete("/settings/gemini")
+async def clear_gemini(user: dict = Depends(get_current_user)):
+    await db.settings.update_one({"tenant_id": tenant_of(user)},
+                                 {"$unset": {"gemini": ""}})
+    return {"ok": True, "configured": False}
+
+@api.post("/settings/gemini/test")
+async def test_gemini(user: dict = Depends(get_current_user)):
+    """Quick sanity check: prompt Gemini with a trivial ping."""
+    try:
+        out = await gemini_generate(tenant_of(user),
+                                    "Balas persis kata: OK",
+                                    "ping")
+        return {"ok": True, "reply": (out or "").strip()[:120]}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(502, f"Test gagal: {str(e)}")
 
 def midtrans_base(mode: str) -> str:
     return "https://api.sandbox.midtrans.com" if mode == "sandbox" else "https://api.midtrans.com"
@@ -1532,24 +1601,21 @@ async def bot_reply(tenant_id: str, phone: str, incoming: str):
     state = sess.get("state", "idle")
 
     if state in ("idle", "done"):
-        # Parse order via AI
+        # Parse order via AI (per-tenant Gemini key). If not configured, skip AI gracefully.
+        parsed = {"items": [], "unmatched": []}
+        products = await db.products.find({"tenant_id": tenant_id}, {"_id": 0}).to_list(500)
         try:
-            from emergentintegrations.llm.chat import LlmChat, UserMessage
-            products = await db.products.find({"tenant_id": tenant_id}, {"_id": 0}).to_list(500)
             catalog = "\n".join([f"- {p['name']} (id={p['id']}, harga={p['sell_price']}, stok={p['stock']})" for p in products])
-            chat = LlmChat(api_key=EMERGENT_LLM_KEY, session_id=f"wa-{uuid.uuid4()}",
-                system_message=("Cocokkan item pesanan pelanggan dengan katalog. Balas ONLY JSON: "
-                                '{"items":[{"product_id":"...","name":"...","qty":<int>}],"unmatched":["..."]}.'
-                                "Jangan pakai markdown.")
-            ).with_model("gemini", "gemini-3-flash-preview")
-            r = await chat.send_message(UserMessage(text=f"KATALOG:\n{catalog}\n\nPESAN:\n{txt}"))
+            system = ("Cocokkan item pesanan pelanggan dengan katalog. Balas ONLY JSON: "
+                      '{"items":[{"product_id":"...","name":"...","qty":<int>}],"unmatched":["..."]}.'
+                      "Jangan pakai markdown.")
+            r = await gemini_generate(tenant_id, system, f"KATALOG:\n{catalog}\n\nPESAN:\n{txt}")
             import re, json
             t = re.sub(r"^```(json)?", "", str(r).strip()).rstrip("`").strip()
             m = re.search(r"\{.*\}", t, re.DOTALL)
             parsed = json.loads(m.group(0)) if m else {"items": [], "unmatched": []}
         except Exception:
-            parsed = {"items": [], "unmatched": []}
-            products = []
+            logging.exception("WA bot AI parse skipped")
 
         by_id = {p["id"]: p for p in products}
         cart = []
