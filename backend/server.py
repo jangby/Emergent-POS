@@ -18,6 +18,7 @@ import jwt
 import httpx
 from cryptography.fernet import Fernet
 from fastapi import FastAPI, APIRouter, HTTPException, Request, Response, Depends, UploadFile, File, Form
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -99,6 +100,11 @@ def tenant_of(user: dict) -> str:
 # --- Gemini (BYOK per-tenant) helpers ---
 GEMINI_MODEL_TEXT = "gemini-2.5-flash"
 GEMINI_MODEL_VISION = "gemini-2.5-flash"
+GEMINI_TIMEOUT_SEC = 45  # keep under Cloudflare / ingress 60-100s cutoff
+
+# genai.configure() sets a *process-global* API key. Serialize configure+call so
+# concurrent tenants with different keys can't clobber each other mid-call.
+_gemini_lock = asyncio.Lock()
 
 async def get_gemini_key(tenant_id: str) -> str:
     doc = await db.settings.find_one({"tenant_id": tenant_id}) or {}
@@ -110,11 +116,37 @@ async def get_gemini_key(tenant_id: str) -> str:
         )
     return dec(enc_key)
 
+def _extract_text_safely(resp) -> str:
+    """`resp.text` raises when candidates are blocked or empty. Recover gracefully."""
+    try:
+        return resp.text or ""
+    except Exception:
+        pass
+    try:
+        pieces = []
+        for cand in getattr(resp, "candidates", []) or []:
+            content = getattr(cand, "content", None)
+            for part in (getattr(content, "parts", []) or []):
+                t = getattr(part, "text", None)
+                if t:
+                    pieces.append(t)
+        return "".join(pieces)
+    except Exception:
+        return ""
+
 async def gemini_generate(tenant_id: str, system: str, user_prompt: str,
                           image_b64: Optional[str] = None,
                           image_mime: str = "image/jpeg",
                           model_name: Optional[str] = None) -> str:
-    """Call Gemini via the official google-generativeai SDK using the tenant's own API key."""
+    """Call Gemini via the official google-generativeai SDK using the tenant's own API key.
+
+    Guarantees:
+      - Never blocks the FastAPI event loop (runs in threadpool).
+      - Never crashes: any SDK exception is translated to an HTTPException with a
+        clear message and the full traceback is written to server logs.
+      - Enforces a hard timeout ({GEMINI_TIMEOUT_SEC}s) so Cloudflare / ingress
+        never sees an idle request.
+    """
     key = await get_gemini_key(tenant_id)
     mname = model_name or (GEMINI_MODEL_VISION if image_b64 else GEMINI_MODEL_TEXT)
 
@@ -125,20 +157,63 @@ async def gemini_generate(tenant_id: str, system: str, user_prompt: str,
         parts: list = [user_prompt]
         if image_b64:
             parts.append({"mime_type": image_mime, "data": base64.b64decode(image_b64)})
-        resp = model.generate_content(parts,
-                                      generation_config={"response_mime_type": "text/plain"})
-        return resp.text or ""
+        resp = model.generate_content(
+            parts,
+            generation_config={"response_mime_type": "text/plain"},
+            request_options={"timeout": GEMINI_TIMEOUT_SEC},
+        )
+        return _extract_text_safely(resp)
 
     try:
-        return await asyncio.to_thread(_run)
+        async with _gemini_lock:
+            # asyncio.wait_for adds an outer safety net in case the SDK ignores its timeout
+            return await asyncio.wait_for(
+                run_in_threadpool(_run),
+                timeout=GEMINI_TIMEOUT_SEC + 10,
+            )
     except HTTPException:
         raise
+    except asyncio.TimeoutError:
+        logging.error("Gemini call timed out after %ss", GEMINI_TIMEOUT_SEC + 10)
+        raise HTTPException(
+            504,
+            "Gemini terlalu lama merespons. Coba lagi sebentar atau periksa koneksi internet Anda."
+        )
     except Exception as e:
-        msg = str(e)
+        # Always log full traceback for debugging.
+        logging.error("Gemini call failed: %s", e, exc_info=True)
+        msg = str(e) or type(e).__name__
         low = msg.lower()
-        if "api key" in low or "api_key" in low or "invalid" in low or "permission" in low:
-            raise HTTPException(400, f"Gemini API Key tidak valid atau ditolak: {msg}")
-        raise HTTPException(502, f"Panggilan Gemini gagal: {msg}")
+        if ("api key" in low or "api_key" in low or "api_key_invalid" in low
+                or "unauthenticated" in low or "401" in low):
+            raise HTTPException(
+                400,
+                f"Gemini API Key tidak valid atau ditolak. Perbarui key di Pengaturan → Konfigurasi AI. ({msg[:200]})"
+            )
+        if "permission" in low or "403" in low:
+            raise HTTPException(
+                403,
+                f"Gemini menolak permintaan (permission denied). Pastikan API key Anda mengaktifkan Generative Language API. ({msg[:200]})"
+            )
+        if "quota" in low or "resource_exhausted" in low or "429" in low or "rate" in low:
+            raise HTTPException(
+                429,
+                f"Kuota Gemini terlampaui. Coba lagi nanti atau upgrade paket API Anda. ({msg[:200]})"
+            )
+        if "deadline" in low or "timeout" in low or "504" in low:
+            raise HTTPException(
+                504,
+                f"Gemini timeout. Coba lagi sebentar. ({msg[:200]})"
+            )
+        if "safety" in low or "blocked" in low or "block_reason" in low:
+            raise HTTPException(
+                400,
+                f"Permintaan diblokir oleh filter keamanan Gemini. Coba ubah kata pada prompt. ({msg[:200]})"
+            )
+        raise HTTPException(
+            500,
+            f"Gemini gagal merespons. Silakan coba lagi. ({msg[:200]})"
+        )
 
 def enc(v: str) -> str:
     return fernet.encrypt(v.encode()).decode() if fernet and v else v
