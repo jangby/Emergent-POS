@@ -417,6 +417,7 @@ async def create_transaction(body: TransactionIn, user: dict = Depends(get_curre
            "net_profit": net_profit,
            "cashier": user["email"],
            "cashier_id": user["id"],
+           "cashier_name": user.get("name") or user["email"].split("@")[0],
            "shift_id": open_shift["id"] if open_shift else None,
            "customer_id": body.customer_id,
            "customer_name": body.customer_name,
@@ -1063,6 +1064,9 @@ def format_receipt_wa(store: dict, tx: dict) -> str:
     lines.append("--------------------------------")
     lines.append(f"No : {tx['order_id']}")
     lines.append(f"Tgl: {datetime.fromisoformat(tx['created_at']).strftime('%d/%m/%Y %H:%M')}")
+    cashier_display = tx.get("cashier_name") or (tx.get("cashier") or "").split("@")[0]
+    if cashier_display:
+        lines.append(f"Kasir: {cashier_display}")
     lines.append("--------------------------------")
     for it in tx["items"]:
         lines.append(f"{it['name']}")
@@ -1541,11 +1545,26 @@ async def compute_shift_totals(shift_id: str, tenant_id: str) -> dict:
 
 @api.get("/shifts/current")
 async def shift_current(user: dict = Depends(get_current_user)):
+    # Today's sold (across all shifts today for THIS user) — for cashier dashboard
+    today_start = datetime.combine(now_utc().date(), datetime.min.time(), tzinfo=timezone.utc).isoformat()
+    today_txs = await db.transactions.find({"tenant_id": tenant_of(user),
+                                            "cashier_id": user["id"],
+                                            "status": "completed",
+                                            "created_at": {"$gte": today_start}},
+                                           {"_id": 0}).to_list(2000)
+    today_sold = sum(t.get("total", 0) for t in today_txs)
+    today_tx_count = len(today_txs)
+    today_cash = sum(t["total"] for t in today_txs if t.get("payment_method") == "cash")
+    today_qris = sum(t["total"] for t in today_txs if t.get("payment_method") == "qris")
+    today_summary = {
+        "revenue": today_sold, "tx_count": today_tx_count,
+        "cash": today_cash, "qris": today_qris,
+    }
     s = await get_open_shift(user["id"], tenant_of(user))
     if not s:
-        return {"open": False}
+        return {"open": False, "today": today_summary}
     totals = await compute_shift_totals(s["id"], tenant_of(user))
-    return {"open": True, "shift": s, "totals": totals}
+    return {"open": True, "shift": s, "totals": totals, "today": today_summary}
 
 @api.post("/shifts/open")
 async def shift_open(body: ShiftOpenIn, user: dict = Depends(get_current_user)):
@@ -1581,8 +1600,11 @@ async def shift_close(body: ShiftCloseIn, user: dict = Depends(get_current_user)
 
 @api.get("/shifts")
 async def list_shifts(user: dict = Depends(get_current_user)):
-    items = await db.shifts.find({"tenant_id": tenant_of(user)},
-                                 {"_id": 0}).sort("opened_at", -1).to_list(100)
+    # Cashiers see only their own shifts; owners see all shifts in the tenant.
+    query = {"tenant_id": tenant_of(user)}
+    if not is_owner(user):
+        query["user_id"] = user["id"]
+    items = await db.shifts.find(query, {"_id": 0}).sort("opened_at", -1).to_list(100)
     return items
 
 # --- Promotions ---

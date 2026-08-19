@@ -75,6 +75,8 @@ function buildReceiptBytes({ store, tx }) {
   parts.push(new Uint8Array([ESC, 0x61, 0x00])); // left
   parts.push(enc.encode(`No  : ${tx.order_id}\n`));
   parts.push(enc.encode(`Tgl : ${new Date(tx.created_at).toLocaleString("id-ID")}\n`));
+  const cashierDisplay = tx.cashier_name || (tx.cashier || "").split("@")[0];
+  if (cashierDisplay) parts.push(enc.encode(`Kasir: ${cashierDisplay}\n`));
   parts.push(enc.encode("--------------------------------\n"));
 
   const fmt = (n) => new Intl.NumberFormat("id-ID").format(Math.round(n || 0));
@@ -157,6 +159,7 @@ export function printReceiptWeb({ store, tx }) {
     <hr/>
     <div>No: ${tx.order_id}</div>
     <div>Tgl: ${new Date(tx.created_at).toLocaleString("id-ID")}</div>
+    ${(tx.cashier_name || (tx.cashier || "").split("@")[0]) ? `<div>Kasir: ${tx.cashier_name || (tx.cashier || "").split("@")[0]}</div>` : ""}
     <hr/>
     <table>${tx.items.map(it => `
       <tr><td colspan="2">${it.name}</td></tr>
