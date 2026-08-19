@@ -96,6 +96,15 @@ def tenant_of(user: dict) -> str:
     """Return the tenant id for the given authenticated user."""
     return user.get("tenant_id") or user["id"]
 
+def is_owner(user: dict) -> bool:
+    return (user.get("role") or "owner") == "owner"
+
+async def require_owner(user: dict = Depends(get_current_user)) -> dict:
+    """Guard: raise 403 if the caller is not the Store Owner."""
+    if not is_owner(user):
+        raise HTTPException(403, "Akses ditolak. Hanya pemilik toko yang bisa mengakses fitur ini.")
+    return user
+
 
 # --- Gemini (BYOK per-tenant) helpers ---
 GEMINI_MODEL_TEXT = "gemini-3.6-flash"
@@ -266,7 +275,7 @@ async def register(body: RegisterIn, response: Response):
     refresh = create_refresh_token(uid)
     set_auth_cookies(response, access, refresh)
     return {"id": uid, "email": email, "name": body.name, "role": "owner",
-            "access_token": access}
+            "tenant_id": uid, "access_token": access}
 
 @api.post("/auth/login")
 async def login(body: LoginIn, response: Response):
@@ -277,7 +286,9 @@ async def login(body: LoginIn, response: Response):
     access = create_access_token(user["id"], email)
     refresh = create_refresh_token(user["id"])
     set_auth_cookies(response, access, refresh)
-    return {"id": user["id"], "email": email, "name": user["name"], "role": user.get("role", "owner"),
+    return {"id": user["id"], "email": email, "name": user["name"],
+            "role": user.get("role", "owner"),
+            "tenant_id": user.get("tenant_id") or user["id"],
             "access_token": access}
 
 @api.post("/auth/logout")
@@ -326,7 +337,7 @@ async def list_products(user: dict = Depends(get_current_user)):
     return items
 
 @api.post("/products")
-async def create_product(body: ProductIn, user: dict = Depends(get_current_user)):
+async def create_product(body: ProductIn, user: dict = Depends(require_owner)):
     pid = str(uuid.uuid4())
     doc = {"id": pid, "tenant_id": tenant_of(user), **body.model_dump(),
            "created_at": now_utc().isoformat()}
@@ -334,7 +345,7 @@ async def create_product(body: ProductIn, user: dict = Depends(get_current_user)
     return strip_id(doc)
 
 @api.put("/products/{pid}")
-async def update_product(pid: str, body: ProductIn, user: dict = Depends(get_current_user)):
+async def update_product(pid: str, body: ProductIn, user: dict = Depends(require_owner)):
     r = await db.products.update_one({"id": pid, "tenant_id": tenant_of(user)},
                                      {"$set": body.model_dump()})
     if r.matched_count == 0:
@@ -343,7 +354,7 @@ async def update_product(pid: str, body: ProductIn, user: dict = Depends(get_cur
     return doc
 
 @api.delete("/products/{pid}")
-async def delete_product(pid: str, user: dict = Depends(get_current_user)):
+async def delete_product(pid: str, user: dict = Depends(require_owner)):
     await db.products.delete_one({"id": pid, "tenant_id": tenant_of(user)})
     return {"ok": True}
 
@@ -474,7 +485,7 @@ async def get_transaction(tid: str, user: dict = Depends(get_current_user)):
 
 # --- Analytics ---
 @api.get("/analytics/summary")
-async def analytics_summary(user: dict = Depends(get_current_user)):
+async def analytics_summary(user: dict = Depends(require_owner)):
     all_tx = await db.transactions.find({"tenant_id": tenant_of(user),
                                          "status": "completed"}, {"_id": 0}).to_list(5000)
     today = now_utc().date()
@@ -522,7 +533,7 @@ async def analytics_summary(user: dict = Depends(get_current_user)):
 
 # --- Cashier Leaderboard (today) ---
 @api.get("/analytics/cashier-leaderboard")
-async def cashier_leaderboard(user: dict = Depends(get_current_user)):
+async def cashier_leaderboard(user: dict = Depends(require_owner)):
     today = now_utc().date()
     cutoff = today.isoformat()
     all_tx = await db.transactions.find({"tenant_id": tenant_of(user),
@@ -578,7 +589,7 @@ async def import_template(user: dict = Depends(get_current_user)):
         headers={"Content-Disposition": 'attachment; filename="template_produk.xlsx"'})
 
 @api.post("/products/import")
-async def import_products(file: UploadFile = File(...), user: dict = Depends(get_current_user)):
+async def import_products(file: UploadFile = File(...), user: dict = Depends(require_owner)):
     from openpyxl import load_workbook
     from io import BytesIO
     content = await file.read()
@@ -715,7 +726,7 @@ async def pay_debt(cid: str, body: DebtPayIn, user: dict = Depends(get_current_u
     return {"paid": pay, "remaining_debt": cust.get("total_debt", 0) - pay}
 
 @api.post("/customers/{cid}/send-reminder")
-async def send_debt_reminder(cid: str, user: dict = Depends(get_current_user)):
+async def send_debt_reminder(cid: str, user: dict = Depends(require_owner)):
     cust = await db.customers.find_one({"id": cid, "tenant_id": tenant_of(user)})
     if not cust:
         raise HTTPException(404, "Pelanggan tidak ditemukan")
@@ -765,14 +776,14 @@ class ExpenseIn(BaseModel):
     note: str = ""
 
 @api.get("/expenses")
-async def list_expenses(days: int = 30, user: dict = Depends(get_current_user)):
+async def list_expenses(days: int = 30, user: dict = Depends(require_owner)):
     cutoff = (now_utc() - timedelta(days=days)).isoformat()
     return await db.expenses.find({"tenant_id": tenant_of(user),
                                    "date": {"$gte": cutoff}},
                                   {"_id": 0}).sort("date", -1).to_list(500)
 
 @api.post("/expenses")
-async def create_expense(body: ExpenseIn, user: dict = Depends(get_current_user)):
+async def create_expense(body: ExpenseIn, user: dict = Depends(require_owner)):
     eid = str(uuid.uuid4())
     doc = {"id": eid, "tenant_id": tenant_of(user), **body.model_dump(),
            "date": body.date or now_utc().isoformat(),
@@ -782,12 +793,12 @@ async def create_expense(body: ExpenseIn, user: dict = Depends(get_current_user)
     return strip_id(doc)
 
 @api.delete("/expenses/{eid}")
-async def delete_expense(eid: str, user: dict = Depends(get_current_user)):
+async def delete_expense(eid: str, user: dict = Depends(require_owner)):
     await db.expenses.delete_one({"id": eid, "tenant_id": tenant_of(user)})
     return {"ok": True}
 
 @api.get("/analytics/net-profit")
-async def net_profit(days: int = 30, user: dict = Depends(get_current_user)):
+async def net_profit(days: int = 30, user: dict = Depends(require_owner)):
     cutoff = (now_utc() - timedelta(days=days)).isoformat()
     txs = await db.transactions.find({"tenant_id": tenant_of(user),
                                       "created_at": {"$gte": cutoff},
@@ -819,7 +830,7 @@ async def net_profit(days: int = 30, user: dict = Depends(get_current_user)):
 
 # --- AI Dynamic Bundling ---
 @api.get("/ai/suggest-bundles")
-async def suggest_bundles(user: dict = Depends(get_current_user)):
+async def suggest_bundles(user: dict = Depends(require_owner)):
     """AI detects slow-moving products and suggests bundles with popular ones."""
     try:
         # Compute movement over last 30 days
@@ -878,7 +889,7 @@ class ApplyBundleIn(BaseModel):
     discount_pct: int = 10
 
 @api.post("/ai/apply-bundle")
-async def apply_bundle(body: ApplyBundleIn, user: dict = Depends(get_current_user)):
+async def apply_bundle(body: ApplyBundleIn, user: dict = Depends(require_owner)):
     """Create a BxGy or percentage promo based on suggestion."""
     slow = await db.products.find_one({"id": body.slow_id, "tenant_id": tenant_of(user)})
     if not slow:
@@ -899,7 +910,7 @@ async def apply_bundle(body: ApplyBundleIn, user: dict = Depends(get_current_use
 
 # --- AI: Vision OCR for wholesale receipt ---
 @api.post("/ai/scan-receipt")
-async def scan_receipt(file: UploadFile = File(...), user: dict = Depends(get_current_user)):
+async def scan_receipt(file: UploadFile = File(...), user: dict = Depends(require_owner)):
     try:
         content = await file.read()
         b64 = base64.b64encode(content).decode()
@@ -935,7 +946,7 @@ class RestockIn(BaseModel):
     items: List[RestockItem]
 
 @api.post("/ai/confirm-restock")
-async def confirm_restock(body: RestockIn, user: dict = Depends(get_current_user)):
+async def confirm_restock(body: RestockIn, user: dict = Depends(require_owner)):
     updated = 0
     created = 0
     for it in body.items:
@@ -965,7 +976,7 @@ async def confirm_restock(body: RestockIn, user: dict = Depends(get_current_user
 
 # --- Barcode label helpers ---
 @api.post("/products/generate-sku")
-async def generate_missing_sku(user: dict = Depends(get_current_user)):
+async def generate_missing_sku(user: dict = Depends(require_owner)):
     """Assign KP-XXXXXXXX SKU to products missing it."""
     prods = await db.products.find({"tenant_id": tenant_of(user),
                                     "$or": [{"sku": {"$in": [None, ""]}},
@@ -1018,7 +1029,7 @@ def normalize_wa_target(t: str) -> str:
     return t
 
 @api.put("/settings/fonnte")
-async def save_fonnte(body: FonnteSettingsIn, user: dict = Depends(get_current_user)):
+async def save_fonnte(body: FonnteSettingsIn, user: dict = Depends(require_owner)):
     await db.settings.update_one({"tenant_id": tenant_of(user)},
                                  {"$set": {"tenant_id": tenant_of(user), "fonnte": {
                                      "token_enc": enc(body.token),
@@ -1027,7 +1038,7 @@ async def save_fonnte(body: FonnteSettingsIn, user: dict = Depends(get_current_u
     return {"ok": True}
 
 @api.post("/whatsapp/send")
-async def wa_send(body: WASendIn, user: dict = Depends(get_current_user)):
+async def wa_send(body: WASendIn, user: dict = Depends(require_owner)):
     token = await get_fonnte_token(tenant_of(user))
     target = normalize_wa_target(body.target)
     try:
@@ -1068,7 +1079,7 @@ def format_receipt_wa(store: dict, tx: dict) -> str:
     return "\n".join(lines)
 
 @api.post("/whatsapp/send-receipt")
-async def wa_send_receipt(body: WASendReceiptIn, user: dict = Depends(get_current_user)):
+async def wa_send_receipt(body: WASendReceiptIn, user: dict = Depends(require_owner)):
     tx = await db.transactions.find_one({"id": body.transaction_id,
                                          "tenant_id": tenant_of(user)}, {"_id": 0})
     if not tx:
@@ -1083,7 +1094,7 @@ class OrderParseIn(BaseModel):
     text: str = Field(min_length=1)
 
 @api.post("/ai/parse-order")
-async def parse_order(body: OrderParseIn, user: dict = Depends(get_current_user)):
+async def parse_order(body: OrderParseIn, user: dict = Depends(require_owner)):
     try:
         products = await db.products.find({"tenant_id": tenant_of(user)}, {"_id": 0}).to_list(500)
         catalog = "\n".join([f"- {p['name']} (id={p['id']}, harga={p['sell_price']}, stok={p['stock']})" for p in products])
@@ -1126,7 +1137,7 @@ async def parse_order(body: OrderParseIn, user: dict = Depends(get_current_user)
 
 # --- AI Business Insights ---
 @api.get("/ai/insights")
-async def ai_insights(user: dict = Depends(get_current_user)):
+async def ai_insights(user: dict = Depends(require_owner)):
     try:
         summary = await analytics_summary(user)
         products = await db.products.find({"tenant_id": tenant_of(user)}, {"_id": 0}).to_list(500)
@@ -1205,7 +1216,7 @@ async def get_settings(user: dict = Depends(get_current_user)):
     }
 
 @api.put("/settings/store")
-async def save_store(body: StoreProfile, user: dict = Depends(get_current_user)):
+async def save_store(body: StoreProfile, user: dict = Depends(require_owner)):
     await db.settings.update_one({"tenant_id": tenant_of(user)},
                                  {"$set": {"tenant_id": tenant_of(user),
                                            "store": body.model_dump()}},
@@ -1213,7 +1224,7 @@ async def save_store(body: StoreProfile, user: dict = Depends(get_current_user))
     return body
 
 @api.put("/settings/midtrans")
-async def save_midtrans(body: MidtransSettingsIn, user: dict = Depends(get_current_user)):
+async def save_midtrans(body: MidtransSettingsIn, user: dict = Depends(require_owner)):
     await db.settings.update_one({"tenant_id": tenant_of(user)},
                                  {"$set": {"tenant_id": tenant_of(user), "midtrans": {
                                      "mode": body.mode,
@@ -1240,7 +1251,7 @@ class GeminiSettingsIn(BaseModel):
     api_key: str = Field(min_length=8)
 
 @api.put("/settings/gemini")
-async def save_gemini(body: GeminiSettingsIn, user: dict = Depends(get_current_user)):
+async def save_gemini(body: GeminiSettingsIn, user: dict = Depends(require_owner)):
     await db.settings.update_one({"tenant_id": tenant_of(user)},
                                  {"$set": {"tenant_id": tenant_of(user), "gemini": {
                                      "api_key_enc": enc(body.api_key.strip()),
@@ -1249,13 +1260,13 @@ async def save_gemini(body: GeminiSettingsIn, user: dict = Depends(get_current_u
     return {"ok": True, "configured": True}
 
 @api.delete("/settings/gemini")
-async def clear_gemini(user: dict = Depends(get_current_user)):
+async def clear_gemini(user: dict = Depends(require_owner)):
     await db.settings.update_one({"tenant_id": tenant_of(user)},
                                  {"$unset": {"gemini": ""}})
     return {"ok": True, "configured": False}
 
 @api.post("/settings/gemini/test")
-async def test_gemini(user: dict = Depends(get_current_user)):
+async def test_gemini(user: dict = Depends(require_owner)):
     """Quick sanity check: prompt Gemini with a trivial ping."""
     try:
         out = await gemini_generate(tenant_of(user),
@@ -1292,7 +1303,7 @@ async def get_branding(user: dict = Depends(get_current_user)):
     }
 
 @api.put("/settings/branding")
-async def save_branding(body: BrandingIn, user: dict = Depends(get_current_user)):
+async def save_branding(body: BrandingIn, user: dict = Depends(require_owner)):
     color = body.theme_color.strip()
     if not _HEX_RE.match(color):
         raise HTTPException(400, "Warna tema harus format hex #RRGGBB (misal #e85d04)")
@@ -1332,7 +1343,7 @@ async def save_branding(body: BrandingIn, user: dict = Depends(get_current_user)
     return {"ok": True, **payload}
 
 @api.delete("/settings/branding")
-async def reset_branding(user: dict = Depends(get_current_user)):
+async def reset_branding(user: dict = Depends(require_owner)):
     await db.settings.update_one({"tenant_id": tenant_of(user)}, {"$unset": {"branding": ""}})
     return {"ok": True}
 
@@ -1453,13 +1464,17 @@ class CashierIn(BaseModel):
     name: str = "Kasir"
 
 @api.get("/users")
-async def list_users(user: dict = Depends(get_current_user)):
+async def list_users(user: dict = Depends(require_owner)):
     users = await db.users.find({"tenant_id": tenant_of(user)},
                                 {"_id": 0, "password_hash": 0}).to_list(200)
     return users
 
+class CashierUpdateIn(BaseModel):
+    name: Optional[str] = None
+    password: Optional[str] = None
+
 @api.post("/users/cashier")
-async def create_cashier(body: CashierIn, user: dict = Depends(get_current_user)):
+async def create_cashier(body: CashierIn, user: dict = Depends(require_owner)):
     email = body.email.lower()
     if await db.users.find_one({"email": email}):
         raise HTTPException(400, "Email sudah terdaftar")
@@ -1472,8 +1487,28 @@ async def create_cashier(body: CashierIn, user: dict = Depends(get_current_user)
     })
     return {"id": uid, "email": email, "name": body.name, "role": "cashier"}
 
+@api.put("/users/{uid}")
+async def update_cashier(uid: str, body: CashierUpdateIn, user: dict = Depends(require_owner)):
+    doc = await db.users.find_one({"id": uid, "tenant_id": tenant_of(user)})
+    if not doc:
+        raise HTTPException(404, "Kasir tidak ditemukan")
+    if doc.get("role") == "owner":
+        raise HTTPException(400, "Tidak bisa mengubah owner via endpoint ini")
+    updates = {}
+    if body.name is not None and body.name.strip():
+        updates["name"] = body.name.strip()
+    if body.password is not None:
+        if len(body.password) < 6:
+            raise HTTPException(400, "Password minimal 6 karakter")
+        updates["password_hash"] = hash_password(body.password)
+    if updates:
+        await db.users.update_one({"id": uid, "tenant_id": tenant_of(user)}, {"$set": updates})
+    doc = await db.users.find_one({"id": uid, "tenant_id": tenant_of(user)},
+                                  {"_id": 0, "password_hash": 0})
+    return doc
+
 @api.delete("/users/{uid}")
-async def delete_cashier(uid: str, user: dict = Depends(get_current_user)):
+async def delete_cashier(uid: str, user: dict = Depends(require_owner)):
     doc = await db.users.find_one({"id": uid, "tenant_id": tenant_of(user)})
     if not doc:
         raise HTTPException(404, "Kasir tidak ditemukan")
@@ -1568,7 +1603,7 @@ async def list_promos(user: dict = Depends(get_current_user)):
                                     {"_id": 0}).sort("name", 1).to_list(200)
 
 @api.post("/promotions")
-async def create_promo(body: PromotionIn, user: dict = Depends(get_current_user)):
+async def create_promo(body: PromotionIn, user: dict = Depends(require_owner)):
     pid = str(uuid.uuid4())
     doc = {"id": pid, "tenant_id": tenant_of(user),
            **body.model_dump(), "created_at": now_utc().isoformat()}
@@ -1576,13 +1611,13 @@ async def create_promo(body: PromotionIn, user: dict = Depends(get_current_user)
     return strip_id(doc)
 
 @api.put("/promotions/{pid}")
-async def update_promo(pid: str, body: PromotionIn, user: dict = Depends(get_current_user)):
+async def update_promo(pid: str, body: PromotionIn, user: dict = Depends(require_owner)):
     await db.promotions.update_one({"id": pid, "tenant_id": tenant_of(user)},
                                    {"$set": body.model_dump()})
     return await db.promotions.find_one({"id": pid, "tenant_id": tenant_of(user)}, {"_id": 0})
 
 @api.delete("/promotions/{pid}")
-async def delete_promo(pid: str, user: dict = Depends(get_current_user)):
+async def delete_promo(pid: str, user: dict = Depends(require_owner)):
     await db.promotions.delete_one({"id": pid, "tenant_id": tenant_of(user)})
     return {"ok": True}
 
@@ -1702,12 +1737,12 @@ async def wa_send_raw(tenant_id: str, target: str, message: str, image_url: Opti
 
 # --- Online Orders ---
 @api.get("/online-orders")
-async def list_online_orders(user: dict = Depends(get_current_user)):
+async def list_online_orders(user: dict = Depends(require_owner)):
     return await db.online_orders.find({"tenant_id": tenant_of(user)},
                                        {"_id": 0}).sort("created_at", -1).to_list(200)
 
 @api.post("/online-orders/{oid}/mark-shipped")
-async def mark_shipped(oid: str, user: dict = Depends(get_current_user)):
+async def mark_shipped(oid: str, user: dict = Depends(require_owner)):
     doc = await db.online_orders.find_one({"id": oid, "tenant_id": tenant_of(user)})
     if not doc:
         raise HTTPException(404, "Order tidak ditemukan")
@@ -1931,7 +1966,7 @@ async def whatsapp_webhook(request: Request):
 
 # Enhance Midtrans webhook to also handle WA-initiated online orders
 @api.post("/whatsapp/simulate-payment/{oid}")
-async def wa_simulate_payment(oid: str, user: dict = Depends(get_current_user)):
+async def wa_simulate_payment(oid: str, user: dict = Depends(require_owner)):
     """Owner-triggered simulation for demo: mark WA order paid & notify customer."""
     o = await db.online_orders.find_one({"id": oid, "tenant_id": tenant_of(user)})
     if not o:
@@ -1975,7 +2010,7 @@ def _xlsx_response(rows: List[dict], sheet_name: str, filename: str, headers: Li
         headers={"Content-Disposition": f'attachment; filename="{filename}"'})
 
 @api.get("/exports/transactions.xlsx")
-async def export_transactions(days: int = 30, user: dict = Depends(get_current_user)):
+async def export_transactions(days: int = 30, user: dict = Depends(require_owner)):
     cutoff = (now_utc() - timedelta(days=days)).isoformat()
     txs = await db.transactions.find({"tenant_id": tenant_of(user),
                                       "created_at": {"$gte": cutoff}},
@@ -2000,7 +2035,7 @@ async def export_transactions(days: int = 30, user: dict = Depends(get_current_u
                            "Subtotal", "Diskon", "Total", "Laba", "Items"])
 
 @api.get("/exports/inventory.xlsx")
-async def export_inventory(user: dict = Depends(get_current_user)):
+async def export_inventory(user: dict = Depends(require_owner)):
     prods = await db.products.find({"tenant_id": tenant_of(user)},
                                    {"_id": 0}).sort("name", 1).to_list(2000)
     rows = [{
@@ -2014,7 +2049,7 @@ async def export_inventory(user: dict = Depends(get_current_user)):
                            "Harga Modal", "Harga Jual", "Nilai Stok (Modal)"])
 
 @api.get("/exports/shifts.xlsx")
-async def export_shifts(user: dict = Depends(get_current_user)):
+async def export_shifts(user: dict = Depends(require_owner)):
     shifts = await db.shifts.find({"tenant_id": tenant_of(user), "status": "closed"},
                                   {"_id": 0}).sort("closed_at", -1).to_list(500)
     rows = []

@@ -20,9 +20,22 @@ import BarcodePrint from "./pages/BarcodePrint";
 import Customers from "./pages/Customers";
 import Expenses from "./pages/Expenses";
 import Bundles from "./pages/Bundles";
+import Staff from "./pages/Staff";
 import OfflineIndicator from "./components/OfflineIndicator";
 import InstallBanner from "./components/InstallPWA";
 import { Toaster } from "./components/ui/sonner";
+
+// Wrapper for owner-only pages: cashiers are auto-redirected to POS.
+const Owner = ({ children }) => (
+  <ProtectedRoute ownerOnly>
+    <Layout>{children}</Layout>
+  </ProtectedRoute>
+);
+const Any = ({ children }) => (
+  <ProtectedRoute>
+    <Layout>{children}</Layout>
+  </ProtectedRoute>
+);
 
 export default function App() {
   return (
@@ -32,20 +45,23 @@ export default function App() {
           <BrowserRouter>
             <Routes>
               <Route path="/login" element={<Login />} />
-              <Route path="/" element={<ProtectedRoute><Layout><POS /></Layout></ProtectedRoute>} />
-              <Route path="/inventory" element={<ProtectedRoute><Layout><Inventory /></Layout></ProtectedRoute>} />
-              <Route path="/restock" element={<ProtectedRoute><Layout><RestockAI /></Layout></ProtectedRoute>} />
-              <Route path="/wa-orders" element={<ProtectedRoute><Layout><WhatsAppOrder /></Layout></ProtectedRoute>} />
-              <Route path="/online-orders" element={<ProtectedRoute><Layout><OnlineOrders /></Layout></ProtectedRoute>} />
-              <Route path="/shifts" element={<ProtectedRoute><Layout><Shifts /></Layout></ProtectedRoute>} />
-              <Route path="/promotions" element={<ProtectedRoute><Layout><Promotions /></Layout></ProtectedRoute>} />
-              <Route path="/barcodes" element={<ProtectedRoute><Layout><BarcodePrint /></Layout></ProtectedRoute>} />
-              <Route path="/customers" element={<ProtectedRoute><Layout><Customers /></Layout></ProtectedRoute>} />
-              <Route path="/expenses" element={<ProtectedRoute><Layout><Expenses /></Layout></ProtectedRoute>} />
-              <Route path="/bundles" element={<ProtectedRoute><Layout><Bundles /></Layout></ProtectedRoute>} />
-              <Route path="/transactions" element={<ProtectedRoute><Layout><Transactions /></Layout></ProtectedRoute>} />
-              <Route path="/analytics" element={<ProtectedRoute><Layout><Analytics /></Layout></ProtectedRoute>} />
-              <Route path="/settings" element={<ProtectedRoute><Layout><Settings /></Layout></ProtectedRoute>} />
+              {/* Cashier + Owner */}
+              <Route path="/" element={<Any><POS /></Any>} />
+              <Route path="/shifts" element={<Any><Shifts /></Any>} />
+              <Route path="/transactions" element={<Any><Transactions /></Any>} />
+              {/* Owner only */}
+              <Route path="/inventory" element={<Owner><Inventory /></Owner>} />
+              <Route path="/restock" element={<Owner><RestockAI /></Owner>} />
+              <Route path="/wa-orders" element={<Owner><WhatsAppOrder /></Owner>} />
+              <Route path="/online-orders" element={<Owner><OnlineOrders /></Owner>} />
+              <Route path="/promotions" element={<Owner><Promotions /></Owner>} />
+              <Route path="/barcodes" element={<Owner><BarcodePrint /></Owner>} />
+              <Route path="/customers" element={<Owner><Customers /></Owner>} />
+              <Route path="/expenses" element={<Owner><Expenses /></Owner>} />
+              <Route path="/bundles" element={<Owner><Bundles /></Owner>} />
+              <Route path="/analytics" element={<Owner><Analytics /></Owner>} />
+              <Route path="/settings" element={<Owner><Settings /></Owner>} />
+              <Route path="/staff" element={<Owner><Staff /></Owner>} />
             </Routes>
             <OfflineIndicator />
             <InstallBanner />
