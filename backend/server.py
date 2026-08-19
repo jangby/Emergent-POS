@@ -83,11 +83,17 @@ async def get_current_user(request: Request) -> dict:
         user = await db.users.find_one({"id": payload["sub"]}, {"_id": 0, "password_hash": 0})
         if not user:
             raise HTTPException(401, "User not found")
+        # Multi-tenant: tenant_id is either the stored one, or the user's own id (self-tenant for owners)
+        user["tenant_id"] = user.get("tenant_id") or user["id"]
         return user
     except jwt.ExpiredSignatureError:
         raise HTTPException(401, "Token expired")
     except jwt.InvalidTokenError:
         raise HTTPException(401, "Invalid token")
+
+def tenant_of(user: dict) -> str:
+    """Return the tenant id for the given authenticated user."""
+    return user.get("tenant_id") or user["id"]
 
 def enc(v: str) -> str:
     return fernet.encrypt(v.encode()).decode() if fernet and v else v
@@ -122,10 +128,20 @@ async def register(body: RegisterIn, response: Response):
     if await db.users.find_one({"email": email}):
         raise HTTPException(400, "Email already registered")
     uid = str(uuid.uuid4())
+    # Multi-tenant: new owner IS their own tenant
     user = {"id": uid, "email": email, "name": body.name, "role": "owner",
+            "tenant_id": uid,
             "password_hash": hash_password(body.password),
             "created_at": now_utc().isoformat()}
     await db.users.insert_one(user)
+    # Seed a default settings doc for the new tenant
+    await db.settings.update_one(
+        {"tenant_id": uid},
+        {"$setOnInsert": {"tenant_id": uid,
+                          "store": StoreProfile(name=f"Toko {body.name}").model_dump(),
+                          "midtrans": {}}},
+        upsert=True,
+    )
     access = create_access_token(uid, email)
     refresh = create_refresh_token(uid)
     set_auth_cookies(response, access, refresh)
@@ -186,32 +202,34 @@ class ProductIn(BaseModel):
 # --- Products ---
 @api.get("/products")
 async def list_products(user: dict = Depends(get_current_user)):
-    items = await db.products.find({}, {"_id": 0}).sort("name", 1).to_list(1000)
+    items = await db.products.find({"tenant_id": tenant_of(user)}, {"_id": 0}).sort("name", 1).to_list(1000)
     return items
 
 @api.post("/products")
 async def create_product(body: ProductIn, user: dict = Depends(get_current_user)):
     pid = str(uuid.uuid4())
-    doc = {"id": pid, **body.model_dump(), "created_at": now_utc().isoformat()}
+    doc = {"id": pid, "tenant_id": tenant_of(user), **body.model_dump(),
+           "created_at": now_utc().isoformat()}
     await db.products.insert_one(doc)
     return strip_id(doc)
 
 @api.put("/products/{pid}")
 async def update_product(pid: str, body: ProductIn, user: dict = Depends(get_current_user)):
-    r = await db.products.update_one({"id": pid}, {"$set": body.model_dump()})
+    r = await db.products.update_one({"id": pid, "tenant_id": tenant_of(user)},
+                                     {"$set": body.model_dump()})
     if r.matched_count == 0:
         raise HTTPException(404, "Not found")
-    doc = await db.products.find_one({"id": pid}, {"_id": 0})
+    doc = await db.products.find_one({"id": pid, "tenant_id": tenant_of(user)}, {"_id": 0})
     return doc
 
 @api.delete("/products/{pid}")
 async def delete_product(pid: str, user: dict = Depends(get_current_user)):
-    await db.products.delete_one({"id": pid})
+    await db.products.delete_one({"id": pid, "tenant_id": tenant_of(user)})
     return {"ok": True}
 
 @api.get("/products/categories")
 async def categories(user: dict = Depends(get_current_user)):
-    cats = await db.products.distinct("category")
+    cats = await db.products.distinct("category", {"tenant_id": tenant_of(user)})
     return sorted(cats)
 
 # --- Transactions ---
@@ -247,14 +265,16 @@ async def create_transaction(body: TransactionIn, user: dict = Depends(get_curre
     for it in body.items:
         net_profit += (it.price - it.buy_price) * it.qty - it.discount
     # Link to open shift, if any
-    open_shift = await db.shifts.find_one({"user_id": user["id"], "status": "open"})
+    open_shift = await db.shifts.find_one({"user_id": user["id"], "status": "open",
+                                           "tenant_id": tenant_of(user)})
     is_credit = body.payment_method == "credit"
     status = "completed"
     if is_credit:
         status = "unpaid"
     elif body.payment_method == "qris" and body.qris_status not in ("settlement", "capture"):
         status = "pending"
-    doc = {"id": tid, "order_id": order_id,
+    doc = {"id": tid, "tenant_id": tenant_of(user),
+           "order_id": order_id,
            "items": [i.model_dump() for i in body.items],
            "subtotal": body.subtotal, "discount": body.discount,
            "tax": body.tax, "total": body.total,
@@ -273,30 +293,34 @@ async def create_transaction(body: TransactionIn, user: dict = Depends(get_curre
            "created_at": now_utc().isoformat()}
     await db.transactions.insert_one(doc)
 
-    # Deduct stock
+    # Deduct stock (tenant-scoped)
     pids = []
     for it in body.items:
-        await db.products.update_one({"id": it.product_id}, {"$inc": {"stock": -it.qty}})
+        await db.products.update_one({"id": it.product_id, "tenant_id": tenant_of(user)},
+                                     {"$inc": {"stock": -it.qty}})
         pids.append(it.product_id)
 
     # Credit: create/upsert customer and add debt ledger
     if is_credit and body.customer_phone:
         cust_id = body.customer_id
         if not cust_id:
-            existing = await db.customers.find_one({"phone": body.customer_phone})
+            existing = await db.customers.find_one({"phone": body.customer_phone,
+                                                    "tenant_id": tenant_of(user)})
             if existing:
                 cust_id = existing["id"]
             else:
                 cust_id = str(uuid.uuid4())
                 await db.customers.insert_one({
-                    "id": cust_id, "name": body.customer_name or body.customer_phone,
+                    "id": cust_id, "tenant_id": tenant_of(user),
+                    "name": body.customer_name or body.customer_phone,
                     "phone": body.customer_phone, "total_debt": 0,
                     "created_at": now_utc().isoformat()
                 })
-        await db.customers.update_one({"id": cust_id},
+        await db.customers.update_one({"id": cust_id, "tenant_id": tenant_of(user)},
                                       {"$inc": {"total_debt": body.total}})
         await db.debt_ledger.insert_one({
-            "id": str(uuid.uuid4()), "customer_id": cust_id,
+            "id": str(uuid.uuid4()), "tenant_id": tenant_of(user),
+            "customer_id": cust_id,
             "transaction_id": tid, "order_id": order_id,
             "type": "debit", "amount": body.total,
             "created_at": now_utc().isoformat(),
@@ -305,7 +329,7 @@ async def create_transaction(body: TransactionIn, user: dict = Depends(get_curre
 
     # Low-stock WA alert (fire and forget)
     try:
-        asyncio.create_task(check_low_stock_and_alert(pids))
+        asyncio.create_task(check_low_stock_and_alert(tenant_of(user), pids))
     except Exception:
         pass
 
@@ -315,7 +339,7 @@ async def create_transaction(body: TransactionIn, user: dict = Depends(get_curre
 async def list_transactions(q: Optional[str] = None, days: int = 30,
                             user: dict = Depends(get_current_user)):
     cutoff = (now_utc() - timedelta(days=days)).isoformat()
-    query = {"created_at": {"$gte": cutoff}}
+    query = {"tenant_id": tenant_of(user), "created_at": {"$gte": cutoff}}
     if q:
         query["order_id"] = {"$regex": q, "$options": "i"}
     items = await db.transactions.find(query, {"_id": 0}).sort("created_at", -1).to_list(500)
@@ -323,7 +347,7 @@ async def list_transactions(q: Optional[str] = None, days: int = 30,
 
 @api.get("/transactions/{tid}")
 async def get_transaction(tid: str, user: dict = Depends(get_current_user)):
-    doc = await db.transactions.find_one({"id": tid}, {"_id": 0})
+    doc = await db.transactions.find_one({"id": tid, "tenant_id": tenant_of(user)}, {"_id": 0})
     if not doc:
         raise HTTPException(404, "Not found")
     return doc
@@ -331,7 +355,8 @@ async def get_transaction(tid: str, user: dict = Depends(get_current_user)):
 # --- Analytics ---
 @api.get("/analytics/summary")
 async def analytics_summary(user: dict = Depends(get_current_user)):
-    all_tx = await db.transactions.find({"status": "completed"}, {"_id": 0}).to_list(5000)
+    all_tx = await db.transactions.find({"tenant_id": tenant_of(user),
+                                         "status": "completed"}, {"_id": 0}).to_list(5000)
     today = now_utc().date()
     week_ago = today - timedelta(days=6)
     month_ago = today - timedelta(days=29)
@@ -380,7 +405,8 @@ async def analytics_summary(user: dict = Depends(get_current_user)):
 async def cashier_leaderboard(user: dict = Depends(get_current_user)):
     today = now_utc().date()
     cutoff = today.isoformat()
-    all_tx = await db.transactions.find({"status": "completed",
+    all_tx = await db.transactions.find({"tenant_id": tenant_of(user),
+                                         "status": "completed",
                                          "created_at": {"$gte": cutoff}},
                                         {"_id": 0}).to_list(5000)
     by_cashier = {}
@@ -398,8 +424,9 @@ async def cashier_leaderboard(user: dict = Depends(get_current_user)):
         else:
             row["qris"] += t.get("total", 0)
     rows = sorted(by_cashier.values(), key=lambda r: r["revenue"], reverse=True)
-    # Attach display names
-    users = {u["email"]: u for u in await db.users.find({}, {"_id": 0, "password_hash": 0}).to_list(200)}
+    # Attach display names (tenant-scoped users)
+    users = {u["email"]: u for u in await db.users.find({"tenant_id": tenant_of(user)},
+                                                        {"_id": 0, "password_hash": 0}).to_list(200)}
     for r in rows:
         r["name"] = users.get(r["cashier"], {}).get("name") or r["cashier"].split("@")[0]
     return rows
@@ -474,17 +501,21 @@ async def import_products(file: UploadFile = File(...), user: dict = Depends(get
                 "sell_price": int(row[i_sell] or 0) if i_sell >= 0 else 0,
                 "image_url": str(row[i_img] or "").strip() if i_img >= 0 else "",
             }
-            # match by SKU first, then by name
+            # match by SKU first, then by name (tenant-scoped)
             existing = None
             if payload["sku"]:
-                existing = await db.products.find_one({"sku": payload["sku"]})
+                existing = await db.products.find_one({"sku": payload["sku"],
+                                                       "tenant_id": tenant_of(user)})
             if not existing:
-                existing = await db.products.find_one({"name": {"$regex": f"^{name}$", "$options": "i"}})
+                existing = await db.products.find_one({"name": {"$regex": f"^{name}$", "$options": "i"},
+                                                       "tenant_id": tenant_of(user)})
             if existing:
-                await db.products.update_one({"id": existing["id"]}, {"$set": payload})
+                await db.products.update_one({"id": existing["id"], "tenant_id": tenant_of(user)},
+                                             {"$set": payload})
                 updated += 1
             else:
-                await db.products.insert_one({"id": str(uuid.uuid4()), **payload,
+                await db.products.insert_one({"id": str(uuid.uuid4()),
+                                              "tenant_id": tenant_of(user), **payload,
                                               "created_at": now_utc().isoformat()})
                 created += 1
         except Exception as e:
@@ -504,27 +535,31 @@ class CustomerIn(BaseModel):
 
 @api.get("/customers")
 async def list_customers(user: dict = Depends(get_current_user)):
-    return await db.customers.find({}, {"_id": 0}).sort("total_debt", -1).to_list(500)
+    return await db.customers.find({"tenant_id": tenant_of(user)}, {"_id": 0}).sort("total_debt", -1).to_list(500)
 
 @api.post("/customers")
 async def create_customer(body: CustomerIn, user: dict = Depends(get_current_user)):
     if body.phone:
-        existing = await db.customers.find_one({"phone": body.phone}, {"_id": 0})
+        existing = await db.customers.find_one({"phone": body.phone,
+                                                "tenant_id": tenant_of(user)}, {"_id": 0})
         if existing:
             return existing
     cid = str(uuid.uuid4())
-    doc = {"id": cid, **body.model_dump(), "total_debt": 0,
+    doc = {"id": cid, "tenant_id": tenant_of(user), **body.model_dump(),
+           "total_debt": 0,
            "created_at": now_utc().isoformat()}
     await db.customers.insert_one(doc)
     return strip_id(doc)
 
 @api.get("/customers/{cid}/ledger")
 async def customer_ledger(cid: str, user: dict = Depends(get_current_user)):
-    cust = await db.customers.find_one({"id": cid}, {"_id": 0})
+    cust = await db.customers.find_one({"id": cid, "tenant_id": tenant_of(user)}, {"_id": 0})
     if not cust:
         raise HTTPException(404, "Pelanggan tidak ditemukan")
-    entries = await db.debt_ledger.find({"customer_id": cid}, {"_id": 0}).sort("created_at", -1).to_list(500)
-    txs = await db.transactions.find({"customer_id": cid}, {"_id": 0}).sort("created_at", -1).to_list(500)
+    entries = await db.debt_ledger.find({"customer_id": cid, "tenant_id": tenant_of(user)},
+                                        {"_id": 0}).sort("created_at", -1).to_list(500)
+    txs = await db.transactions.find({"customer_id": cid, "tenant_id": tenant_of(user)},
+                                     {"_id": 0}).sort("created_at", -1).to_list(500)
     return {"customer": cust, "entries": entries, "transactions": txs}
 
 class DebtPayIn(BaseModel):
@@ -533,32 +568,35 @@ class DebtPayIn(BaseModel):
 
 @api.post("/customers/{cid}/pay-debt")
 async def pay_debt(cid: str, body: DebtPayIn, user: dict = Depends(get_current_user)):
-    cust = await db.customers.find_one({"id": cid})
+    cust = await db.customers.find_one({"id": cid, "tenant_id": tenant_of(user)})
     if not cust:
         raise HTTPException(404, "Pelanggan tidak ditemukan")
     pay = min(body.amount, cust.get("total_debt", 0))
-    await db.customers.update_one({"id": cid}, {"$inc": {"total_debt": -pay}})
+    await db.customers.update_one({"id": cid, "tenant_id": tenant_of(user)},
+                                  {"$inc": {"total_debt": -pay}})
     await db.debt_ledger.insert_one({
-        "id": str(uuid.uuid4()), "customer_id": cid, "type": "credit",
+        "id": str(uuid.uuid4()), "tenant_id": tenant_of(user),
+        "customer_id": cid, "type": "credit",
         "amount": pay, "method": body.method,
         "created_at": now_utc().isoformat(),
     })
     # Mark related unpaid transactions as completed (oldest first) up to `pay` amount
     remain = pay
-    unpaid = await db.transactions.find({"customer_id": cid, "status": "unpaid"},
+    unpaid = await db.transactions.find({"customer_id": cid, "tenant_id": tenant_of(user),
+                                         "status": "unpaid"},
                                         {"_id": 0}).sort("created_at", 1).to_list(200)
     for t in unpaid:
         if remain <= 0:
             break
         if t["total"] <= remain:
-            await db.transactions.update_one({"id": t["id"]},
+            await db.transactions.update_one({"id": t["id"], "tenant_id": tenant_of(user)},
                                              {"$set": {"status": "completed"}})
             remain -= t["total"]
     return {"paid": pay, "remaining_debt": cust.get("total_debt", 0) - pay}
 
 @api.post("/customers/{cid}/send-reminder")
 async def send_debt_reminder(cid: str, user: dict = Depends(get_current_user)):
-    cust = await db.customers.find_one({"id": cid})
+    cust = await db.customers.find_one({"id": cid, "tenant_id": tenant_of(user)})
     if not cust:
         raise HTTPException(404, "Pelanggan tidak ditemukan")
     debt = cust.get("total_debt", 0)
@@ -569,7 +607,7 @@ async def send_debt_reminder(cid: str, user: dict = Depends(get_current_user)):
     # Try to create QRIS link
     qr_url = None
     try:
-        creds = await get_midtrans_creds()
+        creds = await get_midtrans_creds(tenant_of(user))
         oid = f"DEBT-{cid[:6].upper()}-{int(now_utc().timestamp())}"
         payload = {"payment_type": "qris",
                    "transaction_details": {"order_id": oid, "gross_amount": debt},
@@ -584,7 +622,7 @@ async def send_debt_reminder(cid: str, user: dict = Depends(get_current_user)):
                 qr_url = a["url"]; break
     except Exception:
         logging.exception("QRIS for reminder failed")
-    st = await db.settings.find_one({"id": "default"}) or {}
+    st = await db.settings.find_one({"tenant_id": tenant_of(user)}) or {}
     store_name = st.get("store", {}).get("name", "Toko Kami")
     debt_fmt = f"Rp{debt:,}".replace(",", ".")
     msg = (f"Halo *{cust['name']}* 👋\n\n"
@@ -593,7 +631,7 @@ async def send_debt_reminder(cid: str, user: dict = Depends(get_current_user)):
            + ("Silakan bayar langsung via QRIS pada gambar terlampir 📱.\n\n" if qr_url else "")
            + "Salam hangat,\nStaff Kami 🙏")
     try:
-        await wa_send_raw(cust["phone"], msg, image_url=qr_url)
+        await wa_send_raw(tenant_of(user), cust["phone"], msg, image_url=qr_url)
     except Exception as e:
         raise HTTPException(502, f"Gagal kirim WA: {str(e)}")
     return {"ok": True, "amount": debt, "qr_url": qr_url}
@@ -609,12 +647,14 @@ class ExpenseIn(BaseModel):
 @api.get("/expenses")
 async def list_expenses(days: int = 30, user: dict = Depends(get_current_user)):
     cutoff = (now_utc() - timedelta(days=days)).isoformat()
-    return await db.expenses.find({"date": {"$gte": cutoff}}, {"_id": 0}).sort("date", -1).to_list(500)
+    return await db.expenses.find({"tenant_id": tenant_of(user),
+                                   "date": {"$gte": cutoff}},
+                                  {"_id": 0}).sort("date", -1).to_list(500)
 
 @api.post("/expenses")
 async def create_expense(body: ExpenseIn, user: dict = Depends(get_current_user)):
     eid = str(uuid.uuid4())
-    doc = {"id": eid, **body.model_dump(),
+    doc = {"id": eid, "tenant_id": tenant_of(user), **body.model_dump(),
            "date": body.date or now_utc().isoformat(),
            "created_at": now_utc().isoformat(),
            "created_by": user["email"]}
@@ -623,13 +663,14 @@ async def create_expense(body: ExpenseIn, user: dict = Depends(get_current_user)
 
 @api.delete("/expenses/{eid}")
 async def delete_expense(eid: str, user: dict = Depends(get_current_user)):
-    await db.expenses.delete_one({"id": eid})
+    await db.expenses.delete_one({"id": eid, "tenant_id": tenant_of(user)})
     return {"ok": True}
 
 @api.get("/analytics/net-profit")
 async def net_profit(days: int = 30, user: dict = Depends(get_current_user)):
     cutoff = (now_utc() - timedelta(days=days)).isoformat()
-    txs = await db.transactions.find({"created_at": {"$gte": cutoff},
+    txs = await db.transactions.find({"tenant_id": tenant_of(user),
+                                      "created_at": {"$gte": cutoff},
                                       "status": {"$in": ["completed", "unpaid"]}},
                                      {"_id": 0}).to_list(5000)
     revenue = sum(t["total"] for t in txs if t["status"] == "completed")
@@ -638,7 +679,8 @@ async def net_profit(days: int = 30, user: dict = Depends(get_current_user)):
         for it in t.get("items", []):
             hpp += it.get("buy_price", 0) * it.get("qty", 0)
     gross_profit = revenue - hpp
-    exp_docs = await db.expenses.find({"date": {"$gte": cutoff}}, {"_id": 0}).to_list(1000)
+    exp_docs = await db.expenses.find({"tenant_id": tenant_of(user),
+                                       "date": {"$gte": cutoff}}, {"_id": 0}).to_list(1000)
     op_expenses = sum(e.get("amount", 0) for e in exp_docs)
     exp_by_cat = {}
     for e in exp_docs:
@@ -662,14 +704,15 @@ async def suggest_bundles(user: dict = Depends(get_current_user)):
     try:
         # Compute movement over last 30 days
         cutoff = (now_utc() - timedelta(days=30)).isoformat()
-        txs = await db.transactions.find({"created_at": {"$gte": cutoff},
+        txs = await db.transactions.find({"tenant_id": tenant_of(user),
+                                          "created_at": {"$gte": cutoff},
                                           "status": "completed"}, {"_id": 0}).to_list(5000)
         sales_by_product = {}
         for t in txs:
             for it in t.get("items", []):
                 sales_by_product.setdefault(it["product_id"], 0)
                 sales_by_product[it["product_id"]] += it["qty"]
-        products = await db.products.find({}, {"_id": 0}).to_list(500)
+        products = await db.products.find({"tenant_id": tenant_of(user)}, {"_id": 0}).to_list(500)
         # Rank
         rows = []
         for p in products:
@@ -719,12 +762,12 @@ class ApplyBundleIn(BaseModel):
 @api.post("/ai/apply-bundle")
 async def apply_bundle(body: ApplyBundleIn, user: dict = Depends(get_current_user)):
     """Create a BxGy or percentage promo based on suggestion."""
-    slow = await db.products.find_one({"id": body.slow_id})
+    slow = await db.products.find_one({"id": body.slow_id, "tenant_id": tenant_of(user)})
     if not slow:
         raise HTTPException(404, "Produk lambat tidak ditemukan")
     pid = str(uuid.uuid4())
     # Create a percentage promo on the slow product when bought together (simplified: pct on slow when qty>=1)
-    doc = {"id": pid, "name": body.promo_name,
+    doc = {"id": pid, "tenant_id": tenant_of(user), "name": body.promo_name,
            "type": "bxgy", "product_id": body.popular_id,
            "buy_qty": 1, "get_product_id": body.slow_id, "get_qty": 1,
            "value": body.discount_pct, "min_purchase": 0,
@@ -785,18 +828,20 @@ async def confirm_restock(body: RestockIn, user: dict = Depends(get_current_user
     for it in body.items:
         existing = None
         if it.product_id:
-            existing = await db.products.find_one({"id": it.product_id})
+            existing = await db.products.find_one({"id": it.product_id, "tenant_id": tenant_of(user)})
         if not existing:
-            existing = await db.products.find_one({"name": {"$regex": f"^{it.name}$", "$options": "i"}})
+            existing = await db.products.find_one({"name": {"$regex": f"^{it.name}$", "$options": "i"},
+                                                    "tenant_id": tenant_of(user)})
         if existing:
-            await db.products.update_one({"id": existing["id"]},
+            await db.products.update_one({"id": existing["id"], "tenant_id": tenant_of(user)},
                                          {"$inc": {"stock": it.qty},
                                           "$set": {"buy_price": it.buy_price}})
             updated += 1
         else:
             pid = str(uuid.uuid4())
             await db.products.insert_one({
-                "id": pid, "name": it.name, "category": it.category,
+                "id": pid, "tenant_id": tenant_of(user),
+                "name": it.name, "category": it.category,
                 "stock": it.qty, "buy_price": it.buy_price,
                 "sell_price": int(it.buy_price * 1.2),
                 "sku": "", "image_url": "",
@@ -809,23 +854,27 @@ async def confirm_restock(body: RestockIn, user: dict = Depends(get_current_user
 @api.post("/products/generate-sku")
 async def generate_missing_sku(user: dict = Depends(get_current_user)):
     """Assign KP-XXXXXXXX SKU to products missing it."""
-    prods = await db.products.find({"$or": [{"sku": {"$in": [None, ""]}}, {"sku": {"$exists": False}}]},
+    prods = await db.products.find({"tenant_id": tenant_of(user),
+                                    "$or": [{"sku": {"$in": [None, ""]}},
+                                            {"sku": {"$exists": False}}]},
                                    {"_id": 0}).to_list(2000)
     updated = 0
     for p in prods:
         digits = "".join([c for c in p["id"] if c.isdigit()])[:8].ljust(8, "0")
         sku = f"KP{digits}"
-        while await db.products.find_one({"sku": sku, "id": {"$ne": p["id"]}}):
+        while await db.products.find_one({"sku": sku, "tenant_id": tenant_of(user),
+                                          "id": {"$ne": p["id"]}}):
             digits = "".join([str((int(d) + 1) % 10) for d in digits])
             sku = f"KP{digits}"
-        await db.products.update_one({"id": p["id"]}, {"$set": {"sku": sku}})
+        await db.products.update_one({"id": p["id"], "tenant_id": tenant_of(user)},
+                                     {"$set": {"sku": sku}})
         updated += 1
     return {"updated": updated}
 
 # --- Barcode lookup ---
 @api.get("/products/by-sku/{sku}")
 async def product_by_sku(sku: str, user: dict = Depends(get_current_user)):
-    doc = await db.products.find_one({"sku": sku}, {"_id": 0})
+    doc = await db.products.find_one({"sku": sku, "tenant_id": tenant_of(user)}, {"_id": 0})
     if not doc:
         raise HTTPException(404, "Produk tidak ditemukan")
     return doc
@@ -842,8 +891,8 @@ class WASendReceiptIn(BaseModel):
     target: str = Field(min_length=5)
     transaction_id: str
 
-async def get_fonnte_token() -> str:
-    doc = await db.settings.find_one({"id": "default"}) or {}
+async def get_fonnte_token(tenant_id: str) -> str:
+    doc = await db.settings.find_one({"tenant_id": tenant_id}) or {}
     tk_enc = doc.get("fonnte", {}).get("token_enc")
     if not tk_enc:
         raise HTTPException(400, "Fonnte belum dikonfigurasi di Pengaturan.")
@@ -857,8 +906,8 @@ def normalize_wa_target(t: str) -> str:
 
 @api.put("/settings/fonnte")
 async def save_fonnte(body: FonnteSettingsIn, user: dict = Depends(get_current_user)):
-    await db.settings.update_one({"id": "default"},
-                                 {"$set": {"id": "default", "fonnte": {
+    await db.settings.update_one({"tenant_id": tenant_of(user)},
+                                 {"$set": {"tenant_id": tenant_of(user), "fonnte": {
                                      "token_enc": enc(body.token),
                                      "updated_at": now_utc().isoformat(),
                                  }}}, upsert=True)
@@ -866,7 +915,7 @@ async def save_fonnte(body: FonnteSettingsIn, user: dict = Depends(get_current_u
 
 @api.post("/whatsapp/send")
 async def wa_send(body: WASendIn, user: dict = Depends(get_current_user)):
-    token = await get_fonnte_token()
+    token = await get_fonnte_token(tenant_of(user))
     target = normalize_wa_target(body.target)
     try:
         async with httpx.AsyncClient(timeout=20) as hc:
@@ -907,10 +956,11 @@ def format_receipt_wa(store: dict, tx: dict) -> str:
 
 @api.post("/whatsapp/send-receipt")
 async def wa_send_receipt(body: WASendReceiptIn, user: dict = Depends(get_current_user)):
-    tx = await db.transactions.find_one({"id": body.transaction_id}, {"_id": 0})
+    tx = await db.transactions.find_one({"id": body.transaction_id,
+                                         "tenant_id": tenant_of(user)}, {"_id": 0})
     if not tx:
         raise HTTPException(404, "Transaksi tidak ditemukan")
-    st = await db.settings.find_one({"id": "default"}) or {}
+    st = await db.settings.find_one({"tenant_id": tenant_of(user)}) or {}
     store = st.get("store", {})
     msg = format_receipt_wa(store, tx)
     return await wa_send(WASendIn(target=body.target, message=msg), user)
@@ -923,7 +973,7 @@ class OrderParseIn(BaseModel):
 async def parse_order(body: OrderParseIn, user: dict = Depends(get_current_user)):
     try:
         from emergentintegrations.llm.chat import LlmChat, UserMessage
-        products = await db.products.find({}, {"_id": 0}).to_list(500)
+        products = await db.products.find({"tenant_id": tenant_of(user)}, {"_id": 0}).to_list(500)
         catalog = "\n".join([f"- {p['name']} (id={p['id']}, harga={p['sell_price']}, stok={p['stock']})" for p in products])
 
         chat = LlmChat(
@@ -972,7 +1022,7 @@ async def ai_insights(user: dict = Depends(get_current_user)):
     try:
         from emergentintegrations.llm.chat import LlmChat, UserMessage
         summary = await analytics_summary(user)
-        products = await db.products.find({}, {"_id": 0}).to_list(500)
+        products = await db.products.find({"tenant_id": tenant_of(user)}, {"_id": 0}).to_list(500)
         low_stock = [p["name"] for p in products if p["stock"] <= 5]
         top_names = ", ".join([f"{p['name']} ({p['qty']} terjual)" for p in summary["top_products"][:3]]) or "belum ada data"
 
@@ -1017,7 +1067,7 @@ class MidtransSettingsIn(BaseModel):
 
 @api.get("/settings")
 async def get_settings(user: dict = Depends(get_current_user)):
-    doc = await db.settings.find_one({"id": "default"}, {"_id": 0}) or {}
+    doc = await db.settings.find_one({"tenant_id": tenant_of(user)}, {"_id": 0}) or {}
     store = doc.get("store", StoreProfile().model_dump())
     mt = doc.get("midtrans", {})
     fn = doc.get("fonnte", {})
@@ -1037,15 +1087,16 @@ async def get_settings(user: dict = Depends(get_current_user)):
 
 @api.put("/settings/store")
 async def save_store(body: StoreProfile, user: dict = Depends(get_current_user)):
-    await db.settings.update_one({"id": "default"},
-                                 {"$set": {"id": "default", "store": body.model_dump()}},
+    await db.settings.update_one({"tenant_id": tenant_of(user)},
+                                 {"$set": {"tenant_id": tenant_of(user),
+                                           "store": body.model_dump()}},
                                  upsert=True)
     return body
 
 @api.put("/settings/midtrans")
 async def save_midtrans(body: MidtransSettingsIn, user: dict = Depends(get_current_user)):
-    await db.settings.update_one({"id": "default"},
-                                 {"$set": {"id": "default", "midtrans": {
+    await db.settings.update_one({"tenant_id": tenant_of(user)},
+                                 {"$set": {"tenant_id": tenant_of(user), "midtrans": {
                                      "mode": body.mode,
                                      "merchant_id_enc": enc(body.merchant_id),
                                      "client_key_enc": enc(body.client_key),
@@ -1054,8 +1105,8 @@ async def save_midtrans(body: MidtransSettingsIn, user: dict = Depends(get_curre
                                  }}}, upsert=True)
     return {"ok": True}
 
-async def get_midtrans_creds():
-    doc = await db.settings.find_one({"id": "default"}) or {}
+async def get_midtrans_creds(tenant_id: str):
+    doc = await db.settings.find_one({"tenant_id": tenant_id}) or {}
     mt = doc.get("midtrans", {})
     if not mt.get("server_key_enc"):
         raise HTTPException(400, "Midtrans belum dikonfigurasi. Silakan atur di Pengaturan.")
@@ -1074,7 +1125,7 @@ class QRISCreateIn(BaseModel):
 
 @api.post("/payments/qris")
 async def create_qris(body: QRISCreateIn, user: dict = Depends(get_current_user)):
-    creds = await get_midtrans_creds()
+    creds = await get_midtrans_creds(tenant_of(user))
     payload = {
         "payment_type": "qris",
         "transaction_details": {"order_id": body.order_id, "gross_amount": body.amount},
@@ -1098,6 +1149,7 @@ async def create_qris(body: QRISCreateIn, user: dict = Depends(get_current_user)
                 action = a
                 break
     await db.qris_payments.insert_one({
+        "tenant_id": tenant_of(user),
         "order_id": body.order_id, "amount": body.amount,
         "transaction_id": data.get("transaction_id"),
         "status": data.get("transaction_status", "pending"),
@@ -1110,7 +1162,7 @@ async def create_qris(body: QRISCreateIn, user: dict = Depends(get_current_user)
 
 @api.get("/payments/qris/{order_id}/status")
 async def qris_status(order_id: str, user: dict = Depends(get_current_user)):
-    creds = await get_midtrans_creds()
+    creds = await get_midtrans_creds(tenant_of(user))
     async with httpx.AsyncClient(timeout=15) as hc:
         r = await hc.get(f"{midtrans_base(creds['mode'])}/v2/{order_id}/status",
                          auth=(creds['server_key'], ""),
@@ -1119,7 +1171,7 @@ async def qris_status(order_id: str, user: dict = Depends(get_current_user)):
         raise HTTPException(r.status_code, detail=r.json())
     data = r.json()
     status = data.get("transaction_status")
-    await db.qris_payments.update_one({"order_id": order_id},
+    await db.qris_payments.update_one({"order_id": order_id, "tenant_id": tenant_of(user)},
                                       {"$set": {"status": status,
                                                 "updated_at": now_utc().isoformat()}})
     return {"order_id": order_id, "status": status,
@@ -1134,26 +1186,34 @@ async def midtrans_webhook(request: Request):
     supplied = str(payload.get("signature_key", ""))
     if not order_id or not supplied:
         raise HTTPException(400, "invalid notification")
-    creds = await get_midtrans_creds()
+    # Look up tenant via qris_payments or online_orders
+    qp = await db.qris_payments.find_one({"order_id": order_id})
+    oo = await db.online_orders.find_one({"midtrans_order_id": order_id})
+    tenant_id = (qp or {}).get("tenant_id") or (oo or {}).get("tenant_id")
+    if not tenant_id:
+        raise HTTPException(404, "Order tidak ditemukan")
+    creds = await get_midtrans_creds(tenant_id)
     expected = hashlib.sha512(f"{order_id}{status_code}{gross_amount}{creds['server_key']}".encode()).hexdigest()
     if not hmac.compare_digest(expected, supplied):
         raise HTTPException(403, "invalid signature")
     tx_status = payload.get("transaction_status")
-    await db.qris_payments.update_one({"order_id": order_id},
+    await db.qris_payments.update_one({"order_id": order_id, "tenant_id": tenant_id},
                                       {"$set": {"status": tx_status,
                                                 "last_webhook": payload,
                                                 "updated_at": now_utc().isoformat()}},
                                       upsert=True)
     # If it's a WA-initiated order, notify customer & advance state
     if tx_status in ("settlement", "capture"):
-        wa_order = await db.online_orders.find_one({"midtrans_order_id": order_id})
+        wa_order = await db.online_orders.find_one({"midtrans_order_id": order_id,
+                                                    "tenant_id": tenant_id})
         if wa_order and wa_order.get("status") != "paid":
-            await db.online_orders.update_one({"id": wa_order["id"]},
+            await db.online_orders.update_one({"id": wa_order["id"], "tenant_id": tenant_id},
                 {"$set": {"status": "paid", "paid_at": now_utc().isoformat()}})
-            await db.wa_sessions.update_one({"phone": wa_order["customer_phone"]},
+            await db.wa_sessions.update_one({"phone": wa_order["customer_phone"],
+                                              "tenant_id": tenant_id},
                 {"$set": {"state": "done"}})
             try:
-                await wa_send_raw(wa_order["customer_phone"],
+                await wa_send_raw(tenant_id, wa_order["customer_phone"],
                     f"✅ *Pembayaran Berhasil!* Pesanan #{wa_order['id'][:6].upper()} sedang diproses. Terima kasih 🙏")
             except Exception:
                 pass
@@ -1173,7 +1233,8 @@ class CashierIn(BaseModel):
 
 @api.get("/users")
 async def list_users(user: dict = Depends(get_current_user)):
-    users = await db.users.find({}, {"_id": 0, "password_hash": 0}).to_list(200)
+    users = await db.users.find({"tenant_id": tenant_of(user)},
+                                {"_id": 0, "password_hash": 0}).to_list(200)
     return users
 
 @api.post("/users/cashier")
@@ -1184,6 +1245,7 @@ async def create_cashier(body: CashierIn, user: dict = Depends(get_current_user)
     uid = str(uuid.uuid4())
     await db.users.insert_one({
         "id": uid, "email": email, "name": body.name, "role": "cashier",
+        "tenant_id": tenant_of(user),  # inherit tenant from owner
         "password_hash": hash_password(body.password),
         "created_at": now_utc().isoformat(),
     })
@@ -1191,10 +1253,12 @@ async def create_cashier(body: CashierIn, user: dict = Depends(get_current_user)
 
 @api.delete("/users/{uid}")
 async def delete_cashier(uid: str, user: dict = Depends(get_current_user)):
-    doc = await db.users.find_one({"id": uid})
-    if doc and doc.get("role") == "owner":
+    doc = await db.users.find_one({"id": uid, "tenant_id": tenant_of(user)})
+    if not doc:
+        raise HTTPException(404, "Kasir tidak ditemukan")
+    if doc.get("role") == "owner":
         raise HTTPException(400, "Tidak bisa menghapus owner")
-    await db.users.delete_one({"id": uid})
+    await db.users.delete_one({"id": uid, "tenant_id": tenant_of(user)})
     return {"ok": True}
 
 # --- Shifts ---
@@ -1205,11 +1269,13 @@ class ShiftCloseIn(BaseModel):
     closing_cash_actual: int = Field(ge=0)
     notes: str = ""
 
-async def get_open_shift(user_id: str) -> Optional[dict]:
-    return await db.shifts.find_one({"user_id": user_id, "status": "open"}, {"_id": 0})
+async def get_open_shift(user_id: str, tenant_id: str) -> Optional[dict]:
+    return await db.shifts.find_one({"user_id": user_id, "tenant_id": tenant_id,
+                                     "status": "open"}, {"_id": 0})
 
-async def compute_shift_totals(shift_id: str) -> dict:
-    txs = await db.transactions.find({"shift_id": shift_id, "status": "completed"},
+async def compute_shift_totals(shift_id: str, tenant_id: str) -> dict:
+    txs = await db.transactions.find({"shift_id": shift_id, "tenant_id": tenant_id,
+                                      "status": "completed"},
                                      {"_id": 0}).to_list(2000)
     cash_total = sum(t["total"] for t in txs if t["payment_method"] == "cash")
     qris_total = sum(t["total"] for t in txs if t["payment_method"] == "qris")
@@ -1219,19 +1285,20 @@ async def compute_shift_totals(shift_id: str) -> dict:
 
 @api.get("/shifts/current")
 async def shift_current(user: dict = Depends(get_current_user)):
-    s = await get_open_shift(user["id"])
+    s = await get_open_shift(user["id"], tenant_of(user))
     if not s:
         return {"open": False}
-    totals = await compute_shift_totals(s["id"])
+    totals = await compute_shift_totals(s["id"], tenant_of(user))
     return {"open": True, "shift": s, "totals": totals}
 
 @api.post("/shifts/open")
 async def shift_open(body: ShiftOpenIn, user: dict = Depends(get_current_user)):
-    existing = await get_open_shift(user["id"])
+    existing = await get_open_shift(user["id"], tenant_of(user))
     if existing:
         raise HTTPException(400, "Shift sudah dibuka. Tutup dulu.")
     sid = str(uuid.uuid4())
-    doc = {"id": sid, "user_id": user["id"], "user_email": user["email"],
+    doc = {"id": sid, "tenant_id": tenant_of(user),
+           "user_id": user["id"], "user_email": user["email"],
            "user_name": user.get("name", ""),
            "opening_cash": body.opening_cash, "status": "open",
            "opened_at": now_utc().isoformat()}
@@ -1240,25 +1307,26 @@ async def shift_open(body: ShiftOpenIn, user: dict = Depends(get_current_user)):
 
 @api.post("/shifts/close")
 async def shift_close(body: ShiftCloseIn, user: dict = Depends(get_current_user)):
-    s = await get_open_shift(user["id"])
+    s = await get_open_shift(user["id"], tenant_of(user))
     if not s:
         raise HTTPException(400, "Tidak ada shift aktif")
-    totals = await compute_shift_totals(s["id"])
+    totals = await compute_shift_totals(s["id"], tenant_of(user))
     expected_cash = s["opening_cash"] + totals["cash_total"]
     discrepancy = body.closing_cash_actual - expected_cash
-    await db.shifts.update_one({"id": s["id"]}, {"$set": {
+    await db.shifts.update_one({"id": s["id"], "tenant_id": tenant_of(user)}, {"$set": {
         "status": "closed", "closed_at": now_utc().isoformat(),
         "closing_cash_expected": expected_cash,
         "closing_cash_actual": body.closing_cash_actual,
         "discrepancy": discrepancy, "notes": body.notes,
         "totals": totals,
     }})
-    doc = await db.shifts.find_one({"id": s["id"]}, {"_id": 0})
+    doc = await db.shifts.find_one({"id": s["id"], "tenant_id": tenant_of(user)}, {"_id": 0})
     return doc
 
 @api.get("/shifts")
 async def list_shifts(user: dict = Depends(get_current_user)):
-    items = await db.shifts.find({}, {"_id": 0}).sort("opened_at", -1).to_list(100)
+    items = await db.shifts.find({"tenant_id": tenant_of(user)},
+                                 {"_id": 0}).sort("opened_at", -1).to_list(100)
     return items
 
 # --- Promotions ---
@@ -1275,23 +1343,26 @@ class PromotionIn(BaseModel):
 
 @api.get("/promotions")
 async def list_promos(user: dict = Depends(get_current_user)):
-    return await db.promotions.find({}, {"_id": 0}).sort("name", 1).to_list(200)
+    return await db.promotions.find({"tenant_id": tenant_of(user)},
+                                    {"_id": 0}).sort("name", 1).to_list(200)
 
 @api.post("/promotions")
 async def create_promo(body: PromotionIn, user: dict = Depends(get_current_user)):
     pid = str(uuid.uuid4())
-    doc = {"id": pid, **body.model_dump(), "created_at": now_utc().isoformat()}
+    doc = {"id": pid, "tenant_id": tenant_of(user),
+           **body.model_dump(), "created_at": now_utc().isoformat()}
     await db.promotions.insert_one(doc)
     return strip_id(doc)
 
 @api.put("/promotions/{pid}")
 async def update_promo(pid: str, body: PromotionIn, user: dict = Depends(get_current_user)):
-    await db.promotions.update_one({"id": pid}, {"$set": body.model_dump()})
-    return await db.promotions.find_one({"id": pid}, {"_id": 0})
+    await db.promotions.update_one({"id": pid, "tenant_id": tenant_of(user)},
+                                   {"$set": body.model_dump()})
+    return await db.promotions.find_one({"id": pid, "tenant_id": tenant_of(user)}, {"_id": 0})
 
 @api.delete("/promotions/{pid}")
 async def delete_promo(pid: str, user: dict = Depends(get_current_user)):
-    await db.promotions.delete_one({"id": pid})
+    await db.promotions.delete_one({"id": pid, "tenant_id": tenant_of(user)})
     return {"ok": True}
 
 @api.post("/promotions/preview")
@@ -1299,11 +1370,12 @@ async def promo_preview(payload: dict, user: dict = Depends(get_current_user)):
     """Given cart items [{product_id, name, qty, price}], return applied promos + total discount."""
     items = payload.get("items", [])
     subtotal = sum(i["price"] * i["qty"] for i in items)
-    result = await apply_promotions(items, subtotal)
+    result = await apply_promotions(tenant_of(user), items, subtotal)
     return result
 
-async def apply_promotions(items: List[dict], subtotal: int) -> dict:
-    promos = await db.promotions.find({"active": True}, {"_id": 0}).to_list(200)
+async def apply_promotions(tenant_id: str, items: List[dict], subtotal: int) -> dict:
+    promos = await db.promotions.find({"tenant_id": tenant_id, "active": True},
+                                      {"_id": 0}).to_list(200)
     applied = []
     total_discount = 0
     free_items = []
@@ -1352,16 +1424,16 @@ async def apply_promotions(items: List[dict], subtotal: int) -> dict:
             "final_total": max(0, subtotal - total_discount)}
 
 # --- Low-stock alert helper ---
-async def check_low_stock_and_alert(product_ids: List[str]):
+async def check_low_stock_and_alert(tenant_id: str, product_ids: List[str]):
     """After stock decrement, notify owner via WA if any product is at/under threshold (<=5)."""
-    st = await db.settings.find_one({"id": "default"}) or {}
+    st = await db.settings.find_one({"tenant_id": tenant_id}) or {}
     fn = st.get("fonnte", {})
     store = st.get("store", {})
     if not fn.get("token_enc") or not store.get("phone"):
         return
     triggered = []
     for pid in set(product_ids):
-        p = await db.products.find_one({"id": pid}, {"_id": 0})
+        p = await db.products.find_one({"id": pid, "tenant_id": tenant_id}, {"_id": 0})
         if not p:
             continue
         threshold = p.get("min_stock", 5) or 5
@@ -1371,7 +1443,7 @@ async def check_low_stock_and_alert(product_ids: List[str]):
             recent = last and (datetime.fromisoformat(last) > now_utc() - timedelta(hours=6))
             if not recent:
                 triggered.append(p)
-                await db.products.update_one({"id": pid},
+                await db.products.update_one({"id": pid, "tenant_id": tenant_id},
                                              {"$set": {"last_low_alert_at": now_utc().isoformat()}})
     if not triggered:
         return
@@ -1390,8 +1462,8 @@ async def check_low_stock_and_alert(product_ids: List[str]):
         logging.exception("Low-stock alert failed")
 
 # --- WA send helpers (no auth, for bot) ---
-async def wa_send_raw(target: str, message: str, image_url: Optional[str] = None) -> dict:
-    st = await db.settings.find_one({"id": "default"}) or {}
+async def wa_send_raw(tenant_id: str, target: str, message: str, image_url: Optional[str] = None) -> dict:
+    st = await db.settings.find_one({"tenant_id": tenant_id}) or {}
     tk_enc = st.get("fonnte", {}).get("token_enc")
     if not tk_enc:
         raise RuntimeError("Fonnte not configured")
@@ -1410,39 +1482,41 @@ async def wa_send_raw(target: str, message: str, image_url: Optional[str] = None
 # --- Online Orders ---
 @api.get("/online-orders")
 async def list_online_orders(user: dict = Depends(get_current_user)):
-    return await db.online_orders.find({}, {"_id": 0}).sort("created_at", -1).to_list(200)
+    return await db.online_orders.find({"tenant_id": tenant_of(user)},
+                                       {"_id": 0}).sort("created_at", -1).to_list(200)
 
 @api.post("/online-orders/{oid}/mark-shipped")
 async def mark_shipped(oid: str, user: dict = Depends(get_current_user)):
-    doc = await db.online_orders.find_one({"id": oid})
+    doc = await db.online_orders.find_one({"id": oid, "tenant_id": tenant_of(user)})
     if not doc:
         raise HTTPException(404, "Order tidak ditemukan")
     if doc.get("status") == "shipped":
         return {"ok": True, "note": "sudah dikirim"}
     # Decrement stock only when shipped (was reserved on payment)
     for it in doc.get("items", []):
-        await db.products.update_one({"id": it["product_id"]},
+        await db.products.update_one({"id": it["product_id"], "tenant_id": tenant_of(user)},
                                      {"$inc": {"stock": -it["qty"]}})
-    await db.online_orders.update_one({"id": oid},
+    await db.online_orders.update_one({"id": oid, "tenant_id": tenant_of(user)},
                                       {"$set": {"status": "shipped",
                                                 "shipped_at": now_utc().isoformat(),
                                                 "shipped_by": user["email"]}})
     # Notify customer
     try:
-        await wa_send_raw(doc["customer_phone"],
+        await wa_send_raw(tenant_of(user), doc["customer_phone"],
                           f"📦 Pesanan #{doc['id'][:6].upper()} telah dikirim ke {doc.get('address', 'alamat Anda')}. Terima kasih!")
     except Exception:
         pass
-    await check_low_stock_and_alert([it["product_id"] for it in doc.get("items", [])])
-    return await db.online_orders.find_one({"id": oid}, {"_id": 0})
+    await check_low_stock_and_alert(tenant_of(user), [it["product_id"] for it in doc.get("items", [])])
+    return await db.online_orders.find_one({"id": oid, "tenant_id": tenant_of(user)}, {"_id": 0})
 
 # --- WhatsApp bot state machine ---
 # States: idle -> awaiting_confirm -> awaiting_address -> awaiting_payment -> done
-async def bot_reply(phone: str, incoming: str):
+async def bot_reply(tenant_id: str, phone: str, incoming: str):
     """Process incoming WA message and reply. All persistence via db.wa_sessions."""
-    sess = await db.wa_sessions.find_one({"phone": phone})
+    sess = await db.wa_sessions.find_one({"phone": phone, "tenant_id": tenant_id})
     if not sess:
-        sess = {"phone": phone, "state": "idle", "cart": [], "created_at": now_utc().isoformat()}
+        sess = {"phone": phone, "tenant_id": tenant_id, "state": "idle",
+                "cart": [], "created_at": now_utc().isoformat()}
         await db.wa_sessions.insert_one(sess)
 
     txt = (incoming or "").strip()
@@ -1450,9 +1524,9 @@ async def bot_reply(phone: str, incoming: str):
 
     # Global commands
     if lower in ("batal", "cancel", "reset"):
-        await db.wa_sessions.update_one({"phone": phone},
+        await db.wa_sessions.update_one({"phone": phone, "tenant_id": tenant_id},
                                         {"$set": {"state": "idle", "cart": []}})
-        await wa_send_raw(phone, "Pesanan dibatalkan. Ketik menu produk yang ingin dipesan untuk mulai lagi.")
+        await wa_send_raw(tenant_id, phone, "Pesanan dibatalkan. Ketik menu produk yang ingin dipesan untuk mulai lagi.")
         return
 
     state = sess.get("state", "idle")
@@ -1461,7 +1535,7 @@ async def bot_reply(phone: str, incoming: str):
         # Parse order via AI
         try:
             from emergentintegrations.llm.chat import LlmChat, UserMessage
-            products = await db.products.find({}, {"_id": 0}).to_list(500)
+            products = await db.products.find({"tenant_id": tenant_id}, {"_id": 0}).to_list(500)
             catalog = "\n".join([f"- {p['name']} (id={p['id']}, harga={p['sell_price']}, stok={p['stock']})" for p in products])
             chat = LlmChat(api_key=EMERGENT_LLM_KEY, session_id=f"wa-{uuid.uuid4()}",
                 system_message=("Cocokkan item pesanan pelanggan dengan katalog. Balas ONLY JSON: "
@@ -1475,6 +1549,7 @@ async def bot_reply(phone: str, incoming: str):
             parsed = json.loads(m.group(0)) if m else {"items": [], "unmatched": []}
         except Exception:
             parsed = {"items": [], "unmatched": []}
+            products = []
 
         by_id = {p["id"]: p for p in products}
         cart = []
@@ -1485,14 +1560,14 @@ async def bot_reply(phone: str, incoming: str):
                              "qty": int(it["qty"]), "price": pr["sell_price"],
                              "buy_price": pr["buy_price"]})
         if not cart:
-            await wa_send_raw(phone,
+            await wa_send_raw(tenant_id, phone,
                 "Halo! 👋 Sepertinya saya belum menemukan produk yang cocok. "
                 "Coba sebutkan nama produk lebih spesifik, contoh:\n"
                 "- Indomie Goreng 2\n- Kopi Kapal Api 3")
             return
 
         subtotal = sum(c["price"] * c["qty"] for c in cart)
-        promo = await apply_promotions(cart, subtotal)
+        promo = await apply_promotions(tenant_id, cart, subtotal)
         total = promo["final_total"]
 
         summary = "\n".join([f"- {c['qty']}× {c['name']} = Rp{c['price']*c['qty']:,}".replace(",", ".") for c in cart])
@@ -1501,27 +1576,28 @@ async def bot_reply(phone: str, incoming: str):
                f"{promo_lines + chr(10) if promo_lines else ''}"
                f"*Total: Rp{total:,}*\n\n"
                "Ketik *YA* untuk lanjut, atau kirim ulang pesanan.").replace(",", ".")
-        await db.wa_sessions.update_one({"phone": phone},
+        await db.wa_sessions.update_one({"phone": phone, "tenant_id": tenant_id},
             {"$set": {"state": "awaiting_confirm", "cart": cart, "total": total,
                       "subtotal": subtotal, "promo": promo,
                       "updated_at": now_utc().isoformat()}})
-        await wa_send_raw(phone, msg)
+        await wa_send_raw(tenant_id, phone, msg)
         return
 
     if state == "awaiting_confirm":
         if lower in ("ya", "yes", "y", "ok", "oke"):
-            await db.wa_sessions.update_one({"phone": phone},
+            await db.wa_sessions.update_one({"phone": phone, "tenant_id": tenant_id},
                 {"$set": {"state": "awaiting_name"}})
-            await wa_send_raw(phone, "Baik! Boleh saya minta *nama penerima*?")
+            await wa_send_raw(tenant_id, phone, "Baik! Boleh saya minta *nama penerima*?")
             return
         # else re-parse
-        await db.wa_sessions.update_one({"phone": phone}, {"$set": {"state": "idle"}})
-        return await bot_reply(phone, txt)
+        await db.wa_sessions.update_one({"phone": phone, "tenant_id": tenant_id},
+                                        {"$set": {"state": "idle"}})
+        return await bot_reply(tenant_id, phone, txt)
 
     if state == "awaiting_name":
-        await db.wa_sessions.update_one({"phone": phone},
+        await db.wa_sessions.update_one({"phone": phone, "tenant_id": tenant_id},
             {"$set": {"state": "awaiting_address", "customer_name": txt}})
-        await wa_send_raw(phone, "Terima kasih 🙏 Mohon kirim *alamat lengkap pengiriman* Anda.")
+        await wa_send_raw(tenant_id, phone, "Terima kasih 🙏 Mohon kirim *alamat lengkap pengiriman* Anda.")
         return
 
     if state == "awaiting_address":
@@ -1531,7 +1607,8 @@ async def bot_reply(phone: str, incoming: str):
         oid = str(uuid.uuid4())
         order_id_mt = f"WA{oid[:10].upper()}"
         order_doc = {
-            "id": oid, "midtrans_order_id": order_id_mt,
+            "id": oid, "tenant_id": tenant_id,
+            "midtrans_order_id": order_id_mt,
             "customer_phone": phone, "customer_name": sess.get("customer_name", ""),
             "address": txt, "items": cart,
             "subtotal": sess.get("subtotal", total),
@@ -1542,7 +1619,7 @@ async def bot_reply(phone: str, incoming: str):
         await db.online_orders.insert_one(order_doc)
         # Create QRIS via Midtrans
         try:
-            creds = await get_midtrans_creds()
+            creds = await get_midtrans_creds(tenant_id)
             payload = {"payment_type": "qris",
                        "transaction_details": {"order_id": order_id_mt, "gross_amount": total},
                        "qris": {"acquirer": "gopay"}}
@@ -1555,24 +1632,31 @@ async def bot_reply(phone: str, incoming: str):
             for a in data.get("actions", []):
                 if a.get("name") in ("generate-qr-code-v2", "generate-qr-code"):
                     qr_url = a["url"]; break
-            await db.online_orders.update_one({"id": oid},
+            await db.online_orders.update_one({"id": oid, "tenant_id": tenant_id},
                 {"$set": {"qr_url": qr_url, "midtrans_data": data}})
-            await db.wa_sessions.update_one({"phone": phone},
+            # Register in qris_payments for webhook tenant lookup
+            await db.qris_payments.insert_one({
+                "tenant_id": tenant_id, "order_id": order_id_mt,
+                "amount": total, "status": "pending",
+                "created_at": now_utc().isoformat(),
+            })
+            await db.wa_sessions.update_one({"phone": phone, "tenant_id": tenant_id},
                 {"$set": {"state": "awaiting_payment", "order_id": oid,
                           "midtrans_order_id": order_id_mt}})
-            await wa_send_raw(phone,
+            await wa_send_raw(tenant_id, phone,
                 f"📱 Silakan bayar via QRIS berikut sebesar *Rp{total:,}*.\n"
                 f"Setelah bayar, kami otomatis proses pesanan Anda. Terima kasih!".replace(",", "."),
                 image_url=qr_url)
         except Exception as e:
             logging.exception("QRIS create in WA failed")
-            await wa_send_raw(phone,
+            await wa_send_raw(tenant_id, phone,
                 f"Mohon maaf, pembayaran QRIS belum bisa dibuat: {str(e)}. Silakan coba lagi nanti.")
         return
 
     if state == "awaiting_payment":
         # Customer says something while waiting
-        await wa_send_raw(phone, "Kami masih menunggu pembayaran QRIS Anda. Ketik *BATAL* untuk membatalkan.")
+        await wa_send_raw(tenant_id, phone,
+                          "Kami masih menunggu pembayaran QRIS Anda. Ketik *BATAL* untuk membatalkan.")
         return
 
 class WAWebhookIn(BaseModel):
@@ -1580,9 +1664,9 @@ class WAWebhookIn(BaseModel):
     sender: Optional[str] = None
     message: Optional[str] = None
 
-@api.post("/whatsapp/webhook")
-async def whatsapp_webhook(request: Request):
-    # Fonnte posts form-encoded typically. Support both.
+@api.post("/whatsapp/webhook/{tenant_id}")
+async def whatsapp_webhook_tenant(tenant_id: str, request: Request):
+    """Tenant-scoped Fonnte webhook. Configure this URL in Fonnte dashboard per tenant."""
     try:
         form = await request.form()
         data = dict(form)
@@ -1592,8 +1676,37 @@ async def whatsapp_webhook(request: Request):
     message = str(data.get("message") or data.get("text") or "").strip()
     if not sender or not message:
         return {"ok": True, "note": "empty"}
+    # Validate tenant exists
+    exists = await db.users.find_one({"tenant_id": tenant_id, "role": "owner"})
+    if not exists:
+        return {"ok": False, "note": "unknown tenant"}
     try:
-        asyncio.create_task(bot_reply(sender, message))
+        asyncio.create_task(bot_reply(tenant_id, sender, message))
+    except Exception:
+        logging.exception("bot_reply schedule failed")
+    return {"ok": True}
+
+@api.post("/whatsapp/webhook")
+async def whatsapp_webhook(request: Request):
+    """Legacy webhook: routes to the FIRST configured tenant only (kept for backward compat).
+    New tenants should use /api/whatsapp/webhook/{tenant_id}.
+    """
+    try:
+        form = await request.form()
+        data = dict(form)
+    except Exception:
+        data = await request.json()
+    sender = str(data.get("sender") or data.get("from") or "").strip()
+    message = str(data.get("message") or data.get("text") or "").strip()
+    if not sender or not message:
+        return {"ok": True, "note": "empty"}
+    # Route to admin tenant as legacy fallback
+    admin = await db.users.find_one({"email": ADMIN_EMAIL.lower()})
+    if not admin:
+        return {"ok": False, "note": "no admin"}
+    tenant_id = admin.get("tenant_id") or admin["id"]
+    try:
+        asyncio.create_task(bot_reply(tenant_id, sender, message))
     except Exception:
         logging.exception("bot_reply schedule failed")
     return {"ok": True}
@@ -1602,15 +1715,16 @@ async def whatsapp_webhook(request: Request):
 @api.post("/whatsapp/simulate-payment/{oid}")
 async def wa_simulate_payment(oid: str, user: dict = Depends(get_current_user)):
     """Owner-triggered simulation for demo: mark WA order paid & notify customer."""
-    o = await db.online_orders.find_one({"id": oid})
+    o = await db.online_orders.find_one({"id": oid, "tenant_id": tenant_of(user)})
     if not o:
         raise HTTPException(404, "Order tidak ditemukan")
-    await db.online_orders.update_one({"id": oid},
+    await db.online_orders.update_one({"id": oid, "tenant_id": tenant_of(user)},
         {"$set": {"status": "paid", "paid_at": now_utc().isoformat()}})
-    await db.wa_sessions.update_one({"phone": o["customer_phone"]},
+    await db.wa_sessions.update_one({"phone": o["customer_phone"],
+                                      "tenant_id": tenant_of(user)},
         {"$set": {"state": "done"}})
     try:
-        await wa_send_raw(o["customer_phone"],
+        await wa_send_raw(tenant_of(user), o["customer_phone"],
             f"✅ *Pembayaran Berhasil!* Pesanan #{oid[:6].upper()} sedang kami proses. Kami akan info saat dikirim. Terima kasih 🙏")
     except Exception:
         pass
@@ -1645,7 +1759,8 @@ def _xlsx_response(rows: List[dict], sheet_name: str, filename: str, headers: Li
 @api.get("/exports/transactions.xlsx")
 async def export_transactions(days: int = 30, user: dict = Depends(get_current_user)):
     cutoff = (now_utc() - timedelta(days=days)).isoformat()
-    txs = await db.transactions.find({"created_at": {"$gte": cutoff}},
+    txs = await db.transactions.find({"tenant_id": tenant_of(user),
+                                      "created_at": {"$gte": cutoff}},
                                      {"_id": 0}).sort("created_at", -1).to_list(5000)
     rows = []
     for t in txs:
@@ -1668,7 +1783,8 @@ async def export_transactions(days: int = 30, user: dict = Depends(get_current_u
 
 @api.get("/exports/inventory.xlsx")
 async def export_inventory(user: dict = Depends(get_current_user)):
-    prods = await db.products.find({}, {"_id": 0}).sort("name", 1).to_list(2000)
+    prods = await db.products.find({"tenant_id": tenant_of(user)},
+                                   {"_id": 0}).sort("name", 1).to_list(2000)
     rows = [{
         "Nama": p["name"], "Kategori": p["category"], "SKU": p.get("sku", ""),
         "Stok": p.get("stock", 0), "Harga Modal": p.get("buy_price", 0),
@@ -1681,7 +1797,8 @@ async def export_inventory(user: dict = Depends(get_current_user)):
 
 @api.get("/exports/shifts.xlsx")
 async def export_shifts(user: dict = Depends(get_current_user)):
-    shifts = await db.shifts.find({"status": "closed"}, {"_id": 0}).sort("closed_at", -1).to_list(500)
+    shifts = await db.shifts.find({"tenant_id": tenant_of(user), "status": "closed"},
+                                  {"_id": 0}).sort("closed_at", -1).to_list(500)
     rows = []
     for s in shifts:
         t = s.get("totals", {})
@@ -1732,52 +1849,98 @@ SEED_PRODUCTS = [
 async def seed_data():
     # indexes
     await db.users.create_index("email", unique=True)
-    await db.products.create_index("name")
-    await db.products.create_index("sku")
-    await db.transactions.create_index("created_at")
-    await db.transactions.create_index("shift_id")
-    await db.shifts.create_index("user_id")
-    await db.online_orders.create_index("created_at")
+    await db.users.create_index("tenant_id")
+    await db.products.create_index([("tenant_id", 1), ("name", 1)])
+    await db.products.create_index([("tenant_id", 1), ("sku", 1)])
+    await db.transactions.create_index([("tenant_id", 1), ("created_at", -1)])
+    await db.transactions.create_index([("tenant_id", 1), ("shift_id", 1)])
+    await db.shifts.create_index([("tenant_id", 1), ("user_id", 1)])
+    await db.online_orders.create_index([("tenant_id", 1), ("created_at", -1)])
     await db.online_orders.create_index("midtrans_order_id")
-    await db.wa_sessions.create_index("phone", unique=True)
-    await db.customers.create_index("phone")
-    await db.debt_ledger.create_index("customer_id")
-    await db.expenses.create_index("date")
+    # Drop legacy unique index on wa_sessions.phone (was global) if present
+    try:
+        idx = await db.wa_sessions.index_information()
+        for name, spec in idx.items():
+            keys = spec.get("key", [])
+            if [k[0] for k in keys] == ["phone"] and spec.get("unique"):
+                await db.wa_sessions.drop_index(name)
+    except Exception:
+        pass
+    await db.wa_sessions.create_index([("tenant_id", 1), ("phone", 1)], unique=True)
+    await db.customers.create_index([("tenant_id", 1), ("phone", 1)])
+    await db.debt_ledger.create_index([("tenant_id", 1), ("customer_id", 1)])
+    await db.expenses.create_index([("tenant_id", 1), ("date", -1)])
+    await db.settings.create_index("tenant_id", unique=True, sparse=True)
+    await db.qris_payments.create_index("order_id")
+    await db.promotions.create_index("tenant_id")
 
     # admin
     existing = await db.users.find_one({"email": ADMIN_EMAIL.lower()})
     if not existing:
+        admin_uid = str(uuid.uuid4())
         await db.users.insert_one({
-            "id": str(uuid.uuid4()), "email": ADMIN_EMAIL.lower(),
+            "id": admin_uid, "email": ADMIN_EMAIL.lower(),
             "name": "Owner", "role": "owner",
+            "tenant_id": admin_uid,
             "password_hash": hash_password(ADMIN_PASSWORD),
             "created_at": now_utc().isoformat(),
         })
         logging.info(f"Seeded admin {ADMIN_EMAIL}")
+        admin_tenant = admin_uid
     else:
+        # Ensure admin has tenant_id (backfill)
+        admin_tenant = existing.get("tenant_id") or existing["id"]
+        if not existing.get("tenant_id"):
+            await db.users.update_one({"id": existing["id"]},
+                                      {"$set": {"tenant_id": admin_tenant}})
         # Update password to match .env
         if not verify_password(ADMIN_PASSWORD, existing["password_hash"]):
             await db.users.update_one({"email": ADMIN_EMAIL.lower()},
                                       {"$set": {"password_hash": hash_password(ADMIN_PASSWORD)}})
 
-    # products
-    if await db.products.count_documents({}) == 0:
-        for p in SEED_PRODUCTS:
-            await db.products.insert_one({"id": str(uuid.uuid4()), **p,
-                                          "created_at": now_utc().isoformat()})
-        logging.info("Seeded sample products")
+    # Migration: backfill tenant_id on legacy docs (from single-tenant era) → assign to admin tenant
+    legacy_filter = {"$or": [{"tenant_id": {"$exists": False}}, {"tenant_id": None}]}
+    migrate_collections = ["products", "transactions", "shifts", "customers",
+                           "debt_ledger", "expenses", "promotions",
+                           "online_orders", "wa_sessions", "qris_payments"]
+    for coll in migrate_collections:
+        try:
+            r = await db[coll].update_many(legacy_filter, {"$set": {"tenant_id": admin_tenant}})
+            if r.modified_count:
+                logging.info(f"Migrated {r.modified_count} docs in {coll} → tenant {admin_tenant[:8]}")
+        except Exception:
+            logging.exception(f"Migration failed for {coll}")
 
-    # settings default
-    if not await db.settings.find_one({"id": "default"}):
-        await db.settings.insert_one({"id": "default",
+    # Migrate other cashier users without tenant_id → admin tenant
+    await db.users.update_many({"tenant_id": {"$exists": False}, "role": "cashier"},
+                               {"$set": {"tenant_id": admin_tenant}})
+
+    # Migrate legacy settings ({id:"default"}) → tenant-scoped for admin
+    legacy_settings = await db.settings.find_one({"id": "default"})
+    if legacy_settings and not legacy_settings.get("tenant_id"):
+        await db.settings.update_one({"id": "default"},
+                                     {"$set": {"tenant_id": admin_tenant},
+                                      "$unset": {"id": ""}})
+
+    # products seed (only for admin tenant, and only if that tenant has none)
+    if await db.products.count_documents({"tenant_id": admin_tenant}) == 0:
+        for p in SEED_PRODUCTS:
+            await db.products.insert_one({"id": str(uuid.uuid4()),
+                                          "tenant_id": admin_tenant, **p,
+                                          "created_at": now_utc().isoformat()})
+        logging.info("Seeded sample products for admin tenant")
+
+    # settings default (admin tenant)
+    if not await db.settings.find_one({"tenant_id": admin_tenant}):
+        await db.settings.insert_one({"tenant_id": admin_tenant,
                                       "store": StoreProfile(name="KasirPintar Demo",
                                                             address="Jl. Sudirman No. 1, Jakarta",
                                                             phone="0812-3456-7890").model_dump(),
                                       "midtrans": {}})
 
-    # dummy transactions if empty
-    if await db.transactions.count_documents({}) == 0:
-        products = await db.products.find({}, {"_id": 0}).to_list(20)
+    # dummy transactions for admin if empty
+    if await db.transactions.count_documents({"tenant_id": admin_tenant}) == 0:
+        products = await db.products.find({"tenant_id": admin_tenant}, {"_id": 0}).to_list(20)
         import random
         for day_offset in range(28, -1, -1):
             date = now_utc() - timedelta(days=day_offset)
@@ -1797,7 +1960,7 @@ async def seed_data():
                     profit += (pr["sell_price"] - pr["buy_price"]) * qty
                 tid = str(uuid.uuid4())
                 await db.transactions.insert_one({
-                    "id": tid,
+                    "id": tid, "tenant_id": admin_tenant,
                     "order_id": f"TRX-{date.strftime('%y%m%d%H%M%S')}-{tid[:4].upper()}",
                     "items": items, "subtotal": subtotal, "discount": 0, "tax": 0,
                     "total": subtotal, "payment_method": random.choice(["cash", "qris"]),
@@ -1806,7 +1969,7 @@ async def seed_data():
                     "cashier": ADMIN_EMAIL,
                     "created_at": date.isoformat(),
                 })
-        logging.info("Seeded dummy transactions")
+        logging.info("Seeded dummy transactions for admin tenant")
 
 @app.on_event("startup")
 async def startup():

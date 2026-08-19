@@ -143,6 +143,29 @@ export async function clearQueue() {
   await idbClear(STORE_QUEUE);
 }
 
+// --- Full local cache reset (called on login/logout to prevent tenant leakage) ---
+export async function clearAllLocalData() {
+  try {
+    await idbClear(STORE_PRODUCTS);
+    await idbClear(STORE_QUEUE);
+    await idbClear(STORE_META);
+  } catch {}
+  try {
+    const keys = Object.keys(localStorage);
+    for (const k of keys) {
+      if (k.startsWith("kp_cache_") || k.startsWith("kp_last_")) {
+        localStorage.removeItem(k);
+      }
+    }
+  } catch {}
+  try {
+    const keys = Object.keys(sessionStorage);
+    for (const k of keys) {
+      if (k.startsWith("kp_")) sessionStorage.removeItem(k);
+    }
+  } catch {}
+}
+
 export async function syncQueue(api) {
   const q = await getQueue();
   if (!q.length) return { synced: 0, failed: 0 };
