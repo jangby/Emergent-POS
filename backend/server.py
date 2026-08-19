@@ -338,6 +338,124 @@ async def analytics_summary(user: dict = Depends(get_current_user)):
         "top_products": top_list,
     }
 
+# --- Cashier Leaderboard (today) ---
+@api.get("/analytics/cashier-leaderboard")
+async def cashier_leaderboard(user: dict = Depends(get_current_user)):
+    today = now_utc().date()
+    cutoff = today.isoformat()
+    all_tx = await db.transactions.find({"status": "completed",
+                                         "created_at": {"$gte": cutoff}},
+                                        {"_id": 0}).to_list(5000)
+    by_cashier = {}
+    for t in all_tx:
+        c = t.get("cashier") or "-"
+        row = by_cashier.setdefault(c, {"cashier": c, "cashier_id": t.get("cashier_id"),
+                                         "tx_count": 0, "revenue": 0, "profit": 0, "items_sold": 0,
+                                         "cash": 0, "qris": 0})
+        row["tx_count"] += 1
+        row["revenue"] += t.get("total", 0)
+        row["profit"] += t.get("net_profit", 0)
+        row["items_sold"] += sum(i.get("qty", 0) for i in t.get("items", []))
+        if t.get("payment_method") == "cash":
+            row["cash"] += t.get("total", 0)
+        else:
+            row["qris"] += t.get("total", 0)
+    rows = sorted(by_cashier.values(), key=lambda r: r["revenue"], reverse=True)
+    # Attach display names
+    users = {u["email"]: u for u in await db.users.find({}, {"_id": 0, "password_hash": 0}).to_list(200)}
+    for r in rows:
+        r["name"] = users.get(r["cashier"], {}).get("name") or r["cashier"].split("@")[0]
+    return rows
+
+# --- Excel Import for products ---
+@api.get("/products/import-template.xlsx")
+async def import_template(user: dict = Depends(get_current_user)):
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill
+    from io import BytesIO
+    wb = Workbook(); ws = wb.active; ws.title = "Produk"
+    headers = ["Nama", "Kategori", "SKU", "Stok", "Harga Modal", "Harga Jual", "URL Gambar"]
+    fill = PatternFill("solid", fgColor="E85D04"); font = Font(bold=True, color="FFFFFF")
+    for i, h in enumerate(headers, 1):
+        c = ws.cell(row=1, column=i, value=h); c.fill = fill; c.font = font
+    sample = [
+        ["Indomie Goreng", "Mie Instan", "IDM-GRG-001", 50, 2800, 3500, ""],
+        ["Kopi Kapal Api", "Minuman", "KAP-SCH", 100, 1200, 1500, ""],
+    ]
+    for r_idx, row in enumerate(sample, 2):
+        for c_idx, v in enumerate(row, 1):
+            ws.cell(row=r_idx, column=c_idx, value=v)
+    for col in "ABCDEFG":
+        ws.column_dimensions[col].width = 22
+    buf = BytesIO(); wb.save(buf); buf.seek(0)
+    from fastapi.responses import StreamingResponse
+    return StreamingResponse(buf,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": 'attachment; filename="template_produk.xlsx"'})
+
+@api.post("/products/import")
+async def import_products(file: UploadFile = File(...), user: dict = Depends(get_current_user)):
+    from openpyxl import load_workbook
+    from io import BytesIO
+    content = await file.read()
+    try:
+        wb = load_workbook(BytesIO(content), data_only=True)
+    except Exception as e:
+        raise HTTPException(400, f"File tidak valid: {str(e)}")
+    ws = wb.active
+    rows = list(ws.iter_rows(values_only=True))
+    if not rows or len(rows) < 2:
+        raise HTTPException(400, "File kosong")
+    header = [str(h or "").strip().lower() for h in rows[0]]
+    def idx(*names):
+        for n in names:
+            if n in header:
+                return header.index(n)
+        return -1
+    i_name = idx("nama", "name")
+    i_cat = idx("kategori", "category")
+    i_sku = idx("sku", "barcode")
+    i_stock = idx("stok", "stock")
+    i_buy = idx("harga modal", "buy_price", "modal")
+    i_sell = idx("harga jual", "sell_price", "jual")
+    i_img = idx("url gambar", "image_url", "gambar")
+    if i_name < 0:
+        raise HTTPException(400, "Kolom 'Nama' wajib ada")
+    created = updated = errors = 0
+    errs = []
+    for r_idx, row in enumerate(rows[1:], 2):
+        try:
+            name = str(row[i_name] or "").strip()
+            if not name:
+                continue
+            payload = {
+                "name": name,
+                "category": str(row[i_cat] or "Umum").strip() if i_cat >= 0 else "Umum",
+                "sku": str(row[i_sku] or "").strip() if i_sku >= 0 else "",
+                "stock": int(row[i_stock] or 0) if i_stock >= 0 else 0,
+                "buy_price": int(row[i_buy] or 0) if i_buy >= 0 else 0,
+                "sell_price": int(row[i_sell] or 0) if i_sell >= 0 else 0,
+                "image_url": str(row[i_img] or "").strip() if i_img >= 0 else "",
+            }
+            # match by SKU first, then by name
+            existing = None
+            if payload["sku"]:
+                existing = await db.products.find_one({"sku": payload["sku"]})
+            if not existing:
+                existing = await db.products.find_one({"name": {"$regex": f"^{name}$", "$options": "i"}})
+            if existing:
+                await db.products.update_one({"id": existing["id"]}, {"$set": payload})
+                updated += 1
+            else:
+                await db.products.insert_one({"id": str(uuid.uuid4()), **payload,
+                                              "created_at": now_utc().isoformat()})
+                created += 1
+        except Exception as e:
+            errors += 1
+            errs.append(f"Baris {r_idx}: {str(e)}")
+    return {"created": created, "updated": updated, "errors": errors, "error_details": errs[:10]}
+
+
 # --- AI: Vision OCR for wholesale receipt ---
 @api.post("/ai/scan-receipt")
 async def scan_receipt(file: UploadFile = File(...), user: dict = Depends(get_current_user)):

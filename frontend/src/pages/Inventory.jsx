@@ -7,7 +7,7 @@ import { Input } from "../components/ui/input";
 import { Label } from "../components/ui/label";
 import { Badge } from "../components/ui/badge";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "../components/ui/dialog";
-import { Plus, Pencil, Trash2, AlertTriangle, Search, Package, Upload, Loader2, ScanBarcode, Download } from "lucide-react";
+import { Plus, Pencil, Trash2, AlertTriangle, Search, Package, Upload, Loader2, ScanBarcode, Download, FileSpreadsheet } from "lucide-react";
 import { toast } from "sonner";
 import imageCompression from "browser-image-compression";
 import BarcodeScanner from "../components/BarcodeScanner";
@@ -23,7 +23,11 @@ export default function Inventory() {
   const [editing, setEditing] = useState(null);
   const [uploading, setUploading] = useState(false);
   const [scanOpen, setScanOpen] = useState(false);
+  const [importOpen, setImportOpen] = useState(false);
+  const [importResult, setImportResult] = useState(null);
+  const [importing, setImporting] = useState(false);
   const fileRef = useRef(null);
+  const excelRef = useRef(null);
 
   const load = async () => {
     const r = await api.get("/products");
@@ -45,6 +49,24 @@ export default function Inventory() {
     } catch (err) {
       toast.error("Gagal mengompres gambar");
     } finally { setUploading(false); }
+  };
+
+  const onImportExcel = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setImporting(true); setImportResult(null);
+    try {
+      const fd = new FormData(); fd.append("file", file);
+      const r = await api.post("/products/import", fd, { headers: { "Content-Type": "multipart/form-data" }});
+      setImportResult(r.data);
+      toast.success(`${r.data.created} baru · ${r.data.updated} diperbarui`);
+      load();
+    } catch (err) {
+      toast.error(err.response?.data?.detail || "Gagal impor");
+    } finally {
+      setImporting(false);
+      if (excelRef.current) excelRef.current.value = "";
+    }
   };
 
   const save = async () => {
@@ -79,6 +101,9 @@ export default function Inventory() {
         </div>
         <Button onClick={()=>{setForm(empty); setEditing(null); setOpen(true);}} data-testid="add-product-btn" className="tap">
           <Plus className="h-4 w-4 mr-1" /> Tambah Produk
+        </Button>
+        <Button variant="outline" onClick={() => setImportOpen(true)} className="tap" data-testid="import-inv-btn">
+          <FileSpreadsheet className="h-4 w-4 mr-1" /> Import Excel
         </Button>
         <a href={`${API_BASE}/exports/inventory.xlsx`} target="_blank" rel="noopener noreferrer">
           <Button variant="outline" className="tap" data-testid="export-inv-btn">
@@ -179,6 +204,42 @@ export default function Inventory() {
 
       <BarcodeScanner open={scanOpen} onOpenChange={setScanOpen}
         onDetect={(code) => { setForm(f => ({...f, sku: code})); setScanOpen(false); toast.success(`SKU: ${code}`); }} />
+
+      <Dialog open={importOpen} onOpenChange={setImportOpen}>
+        <DialogContent className="max-w-md">
+          <DialogHeader><DialogTitle className="font-display">Import Produk dari Excel</DialogTitle></DialogHeader>
+          <div className="space-y-4">
+            <p className="text-sm text-muted-foreground">
+              Unggah file <b>.xlsx</b> berisi kolom: Nama, Kategori, SKU, Stok, Harga Modal, Harga Jual, URL Gambar.
+              Produk dicocokkan berdasarkan SKU atau Nama. Yang sudah ada akan <b>diperbarui</b>, yang baru <b>dibuat</b>.
+            </p>
+            <a href={`${API_BASE}/products/import-template.xlsx`} target="_blank" rel="noopener noreferrer" className="text-primary text-sm hover:underline flex items-center gap-1" data-testid="import-template">
+              <Download className="h-3 w-3" /> Unduh template Excel
+            </a>
+            <input ref={excelRef} type="file" accept=".xlsx"
+                   onChange={onImportExcel} className="hidden" data-testid="import-file-input" />
+            <Button className="w-full tap" disabled={importing}
+                    onClick={() => excelRef.current?.click()} data-testid="import-pick-btn">
+              {importing ? <Loader2 className="h-4 w-4 animate-spin" /> :
+                <><Upload className="h-4 w-4 mr-1" /> Pilih File Excel</>}
+            </Button>
+            {importResult && (
+              <div className="text-sm bg-emerald-50 dark:bg-emerald-950/30 border border-emerald-500/30 rounded-md p-3 space-y-1" data-testid="import-result">
+                <div>✓ <b>{importResult.created}</b> produk baru dibuat</div>
+                <div>✓ <b>{importResult.updated}</b> produk diperbarui</div>
+                {importResult.errors > 0 && (
+                  <div className="text-destructive">⚠ {importResult.errors} baris error</div>
+                )}
+                {importResult.error_details?.length > 0 && (
+                  <ul className="text-xs text-destructive list-disc pl-5">
+                    {importResult.error_details.map((e, i) => <li key={i}>{e}</li>)}
+                  </ul>
+                )}
+              </div>
+            )}
+          </div>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }
